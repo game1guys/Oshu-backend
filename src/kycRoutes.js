@@ -41,9 +41,15 @@ async function geminiExtract({ apiKey, docType, base64, mimeType = 'image/jpeg' 
     `You are an OCR + document parser for Indian KYC documents.\n` +
     `Return ONLY valid JSON. Do not include markdown.\n\n` +
     `doc_type: ${docType}\n` +
+    `First, validate the image matches doc_type.\n` +
+    `Return these additional fields:\n` +
+    `- is_expected_doc (boolean) — true only if the image clearly looks like the requested doc_type\n` +
+    `- doc_kind (string) — one of: "rc", "license", "aadhar_front", "insurance", "pollution", "other", "unknown"\n` +
+    `- issue (string|null) — short reason if is_expected_doc=false (e.g. "not a document", "wrong document type", "too blurry")\n\n` +
     `Extract fields when present:\n` +
     `- name (person name)\n` +
     `- doc_number (DL number / Aadhaar number masked or last4)\n` +
+    `- vehicle_number (RC vehicle registration number, e.g. "UP32AB1234")\n` +
     `- expiry_date (ISO 8601 date or datetime; if only date, return YYYY-MM-DD)\n\n` +
     `If a field is missing, set it to null.\n`;
 
@@ -181,7 +187,7 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
 
   /**
    * POST /api/kyc/ocr
-   * Body: { doc_type: "license"|"aadhar_front"|"insurance"|"pollution", image_base64: "..." }
+   * Body: { doc_type: "rc"|"license"|"aadhar_front"|"insurance"|"pollution", image_base64: "..." }
    *
    * Calls Gemini OCR (API key must be set on server: GEMINI_API_KEY).
    */
@@ -196,7 +202,7 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
     }
     const doc_type = typeof req.body?.doc_type === 'string' ? req.body.doc_type : '';
     const image_base64 = typeof req.body?.image_base64 === 'string' ? req.body.image_base64 : '';
-    if (!doc_type || !['license', 'aadhar_front', 'insurance', 'pollution'].includes(doc_type)) {
+    if (!doc_type || !['rc', 'license', 'aadhar_front', 'insurance', 'pollution'].includes(doc_type)) {
       return res.status(400).json({ error: 'Invalid doc_type' });
     }
     if (!image_base64 || image_base64.length < 100) {
@@ -209,8 +215,12 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
     try {
       const out = await geminiExtract({ apiKey, docType: doc_type, base64: image_base64 });
       const result = {
+        is_expected_doc: typeof out?.is_expected_doc === 'boolean' ? out.is_expected_doc : null,
+        doc_kind: typeof out?.doc_kind === 'string' ? out.doc_kind.trim() : null,
+        issue: typeof out?.issue === 'string' ? out.issue.trim() : null,
         name: out?.name != null ? normalizeName(out.name) : null,
         doc_number: typeof out?.doc_number === 'string' ? out.doc_number.trim() : null,
+        vehicle_number: typeof out?.vehicle_number === 'string' ? out.vehicle_number.trim() : null,
         expiry_date: typeof out?.expiry_date === 'string' ? out.expiry_date.trim() : null,
       };
       return res.json({ ok: true, result });
