@@ -4,13 +4,38 @@
 
 import { haversineKm } from './geo.js';
 import { awardCoinsForRide } from './coinRoutes.js';
+import { createClient } from '@supabase/supabase-js';
 
 async function getProfile(supabase, userId) {
-  const { data, error } = await supabase.from('profiles').select('id, role, full_name').eq('id', userId).maybeSingle();
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, role, full_name, phone')
+    .eq('id', userId)
+    .maybeSingle();
   if (error) {
     return null;
   }
   return data;
+}
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const anonKey = process.env.SUPABASE_ANON_KEY;
+const anonAuthClient =
+  supabaseUrl && anonKey
+    ? createClient(supabaseUrl, anonKey, { auth: { persistSession: false, autoRefreshToken: false } })
+    : null;
+
+async function phoneFromAuthUser(token) {
+  if (!anonAuthClient || !token) return null;
+  try {
+    const { data, error } = await anonAuthClient.auth.getUser(token);
+    if (error) return null;
+    const u = data?.user;
+    const p = u?.phone ?? u?.user_metadata?.phone ?? u?.user_metadata?.phone_number;
+    return typeof p === 'string' ? p : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Full row fields needed for customer ride pricing / discounts. */
@@ -288,7 +313,26 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const profile = await getProfile(supabase, uid);
     if (!profile || profile.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
+      const last10 = (() => {
+        try {
+          const mid = token.split('.')[1];
+          const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+          const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+          const digits = String(p ?? '').replace(/\D/g, '');
+          return digits.length >= 10 ? digits.slice(-10) : digits;
+        } catch {
+          return '';
+        }
+      })();
+      const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+      const set = new Set((env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean));
+      if (set.has(last10)) {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } else {
+        return res.status(403).json({ error: 'Admin only' });
+      }
     }
     const zoneSlug =
       typeof req.query.zone === 'string' && req.query.zone.trim() ? req.query.zone.trim() : 'in';
@@ -319,7 +363,26 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const profile = await getProfile(supabase, uid);
     if (!profile || profile.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
+      const last10 = (() => {
+        try {
+          const mid = token.split('.')[1];
+          const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+          const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+          const digits = String(p ?? '').replace(/\D/g, '');
+          return digits.length >= 10 ? digits.slice(-10) : digits;
+        } catch {
+          return '';
+        }
+      })();
+      const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+      const set = new Set((env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean));
+      if (set.has(last10)) {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } else {
+        return res.status(403).json({ error: 'Admin only' });
+      }
     }
     const vehicleType = req.params.vehicleType;
     const b = req.body ?? {};
@@ -427,7 +490,26 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const profile = await getProfile(supabase, uid);
     if (!profile || profile.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
+      const last10 = (() => {
+        try {
+          const mid = token.split('.')[1];
+          const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+          const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+          const digits = String(p ?? '').replace(/\D/g, '');
+          return digits.length >= 10 ? digits.slice(-10) : digits;
+        } catch {
+          return '';
+        }
+      })();
+      const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+      const set = new Set((env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean));
+      if (set.has(last10)) {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } else {
+        return res.status(403).json({ error: 'Admin only' });
+      }
     }
     const { data, error } = await supabase.from('packaging_types').select('*').order('sort_order');
     if (error) {
@@ -447,7 +529,26 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const profile = await getProfile(supabase, uid);
     if (!profile || profile.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
+      const last10 = (() => {
+        try {
+          const mid = token.split('.')[1];
+          const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+          const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+          const digits = String(p ?? '').replace(/\D/g, '');
+          return digits.length >= 10 ? digits.slice(-10) : digits;
+        } catch {
+          return '';
+        }
+      })();
+      const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+      const set = new Set((env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean));
+      if (set.has(last10)) {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } else {
+        return res.status(403).json({ error: 'Admin only' });
+      }
     }
     const id = req.params.id;
     const b = req.body ?? {};
@@ -489,7 +590,26 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const profile = await getProfile(supabase, uid);
     if (!profile || profile.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
+      const last10 = (() => {
+        try {
+          const mid = token.split('.')[1];
+          const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+          const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+          const digits = String(p ?? '').replace(/\D/g, '');
+          return digits.length >= 10 ? digits.slice(-10) : digits;
+        } catch {
+          return '';
+        }
+      })();
+      const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+      const set = new Set((env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean));
+      if (set.has(last10)) {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } else {
+        return res.status(403).json({ error: 'Admin only' });
+      }
     }
     const { data: cfg } = await supabase.from('app_booking_config').select('*').eq('id', 1).maybeSingle();
     const mp = await loadManpowerInr(supabase);
@@ -512,7 +632,26 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const profile = await getProfile(supabase, uid);
     if (!profile || profile.role !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
+      const last10 = (() => {
+        try {
+          const mid = token.split('.')[1];
+          const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+          const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+          const digits = String(p ?? '').replace(/\D/g, '');
+          return digits.length >= 10 ? digits.slice(-10) : digits;
+        } catch {
+          return '';
+        }
+      })();
+      const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+      const set = new Set((env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean));
+      if (set.has(last10)) {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } else {
+        return res.status(403).json({ error: 'Admin only' });
+      }
     }
     const b = req.body ?? {};
     const { data: cur } = await supabase.from('app_booking_config').select('*').eq('id', 1).maybeSingle();
@@ -1104,6 +1243,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         overtime_minutes: overtimeMin,
         overtime_charge_inr: overtimeCharge,
         final_payable_inr: finalPayable,
+        payment_status: 'awaiting_payment',
       })
       .eq('id', id)
       .eq('captain_id', uid)
@@ -1118,6 +1258,58 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     emitRide(io, data);
     return res.json({ ride: data });
+  });
+
+  /**
+   * Captain: customer paid cash — record COD (does not credit Oshu wallet; updates lifetime COD stat).
+   */
+  app.post('/api/rides/:id/confirm-cod', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const profile = await getProfile(supabase, uid);
+    if (!profile || profile.role !== 'captain') {
+      return res.status(403).json({ error: 'Captains only' });
+    }
+    const id = req.params.id;
+    const { data: row, error: rowErr } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (rowErr) {
+      return res.status(500).json({ error: rowErr.message });
+    }
+    if (!row || row.captain_id !== uid) {
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (row.status !== 'completed') {
+      return res.status(409).json({ error: 'Ride is not completed' });
+    }
+
+    const { data: rpcRaw, error: rpcErr } = await supabase.rpc('apply_captain_cod_ride_record', {
+      p_ride_id: id,
+    });
+    if (rpcErr) {
+      return res.status(500).json({ error: rpcErr.message });
+    }
+    const result = rpcRaw && typeof rpcRaw === 'object' ? rpcRaw : {};
+    if (result.ok !== true) {
+      const err = result.error;
+      if (err === 'ride_not_completed' || err === 'no_captain') {
+        return res.status(409).json({ error: err });
+      }
+      if (result.duplicate) {
+        return res.json({ ok: true, duplicate: true });
+      }
+      return res.status(400).json({ error: err ?? 'Could not record COD' });
+    }
+    const { data: rideOut } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (rideOut) {
+      emitRide(io, rideOut);
+    }
+    return res.json({ ok: true, cod_amount_inr: result.cod_amount_inr });
   });
 
   /** Captain: past completed jobs. */

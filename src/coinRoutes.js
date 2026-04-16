@@ -15,6 +15,8 @@
  *   POST /api/admin/coins/adjust     — add or deduct coins for a user with reason
  */
 
+import { createClient } from '@supabase/supabase-js';
+
 const COINS_PER_KM_DEFAULT  = 7;   // km to earn 1 coin
 const COIN_VALUE_INR        = 1;   // 1 coin = ₹1
 const MIN_REDEEM_DEFAULT    = 10;  // min coins needed before redeem allowed
@@ -55,6 +57,39 @@ async function getProfile(supabase, userId) {
   return data;
 }
 
+const supabaseUrl = process.env.SUPABASE_URL;
+const anonKey = process.env.SUPABASE_ANON_KEY;
+const anonAuthClient =
+  supabaseUrl && anonKey
+    ? createClient(supabaseUrl, anonKey, { auth: { persistSession: false, autoRefreshToken: false } })
+    : null;
+
+async function phoneFromAuthUser(token) {
+  if (!anonAuthClient || !token) {
+    return null;
+  }
+  try {
+    const { data, error } = await anonAuthClient.auth.getUser(token);
+    if (error) return null;
+    const u = data?.user;
+    const p = u?.phone ?? u?.user_metadata?.phone ?? u?.user_metadata?.phone_number;
+    return typeof p === 'string' ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+async function phoneFromAdminById(supabase, userId) {
+  try {
+    const out = await supabase.auth.admin.getUserById(userId);
+    const u = out?.data?.user;
+    const p = u?.phone ?? u?.user_metadata?.phone ?? u?.user_metadata?.phone_number;
+    return typeof p === 'string' ? p : null;
+  } catch {
+    return null;
+  }
+}
+
 async function requireUser(supabase, getUserId, req, res) {
   const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
   if (!token || !supabase) {
@@ -72,8 +107,44 @@ async function requireUser(supabase, getUserId, req, res) {
 async function requireAdmin(supabase, getUserId, req, res) {
   const uid = await requireUser(supabase, getUserId, req, res);
   if (!uid) return null;
+  const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
   const profile = await getProfile(supabase, uid);
   if (!profile || profile.role !== 'admin') {
+    // Allow-listed admin phones: promote role server-side (service role client).
+    const phone = (() => {
+      try {
+        const mid = token?.split?.('.')?.[1];
+        if (!mid) return null;
+        const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+        const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+        const json = Buffer.from(b64, 'base64').toString('utf8');
+        const payload = JSON.parse(json);
+        const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+        return typeof p === 'string' ? p : null;
+      } catch {
+        return null;
+      }
+    })();
+    const authPhone = await phoneFromAuthUser(token);
+    const adminPhone = await phoneFromAdminById(supabase, uid);
+    const chosenPhone = [phone, authPhone, adminPhone, profile?.phone].find(
+      v => typeof v === 'string' && v.replace(/\D/g, '').length >= 10,
+    );
+    const digits = String(chosenPhone ?? '').replace(/\D/g, '');
+    const last10 = digits.length >= 10 ? digits.slice(-10) : digits;
+    const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+    const set = new Set(
+      (env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean),
+    );
+    if (last10 && set.has(last10)) {
+      // Best-effort persist role; never block whitelisted admin.
+      try {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } catch {
+        // ignore
+      }
+      return uid;
+    }
     res.status(403).json({ error: 'Admin only' });
     return null;
   }

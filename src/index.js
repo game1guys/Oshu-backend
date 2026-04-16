@@ -12,6 +12,8 @@ import { registerCoinRoutes } from './coinRoutes.js';
 import { registerAdminRoutes } from './adminRoutes.js';
 import { registerAddressRoutes } from './addressRoutes.js';
 import { registerReferralRoutes } from './referralRoutes.js';
+import { registerPaymentRoutes, registerRazorpayWebhook } from './paymentRoutes.js';
+import { registerCaptainWalletRoutes } from './captainWalletRoutes.js';
 import { attachTripSocket } from './tripSocket.js';
 
 const app = express();
@@ -79,6 +81,8 @@ async function getUserIdFromAccessToken(token) {
 }
 
 app.use(cors());
+/** Razorpay webhook must see raw body — register before express.json(). */
+registerRazorpayWebhook(app, supabase);
 app.use(express.json({ limit: '50mb' }));
 
 registerKycRoutes(app, { supabase, getUserIdFromAccessToken });
@@ -88,9 +92,26 @@ registerCoinRoutes(app, { supabase, getUserIdFromAccessToken });
 registerAdminRoutes(app, { supabase, getUserIdFromAccessToken });
 registerAddressRoutes(app, { supabase, getUserIdFromAccessToken });
 registerReferralRoutes(app, { supabase, getUserIdFromAccessToken });
+registerPaymentRoutes(app, { supabase, getUserIdFromAccessToken });
+registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccessToken });
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'oshu-backend' });
+  res.json({
+    ok: true,
+    service: 'oshu-backend',
+    uptime_s: Math.round(process.uptime()),
+    now: new Date().toISOString(),
+  });
+});
+
+// Alias (some reverse proxies only forward /api/*).
+app.get('/api/health', (_req, res) => {
+  res.json({
+    ok: true,
+    service: 'oshu-backend',
+    uptime_s: Math.round(process.uptime()),
+    now: new Date().toISOString(),
+  });
 });
 
 app.get('/db/health', async (_req, res) => {

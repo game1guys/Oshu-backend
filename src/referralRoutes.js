@@ -105,4 +105,90 @@ export function registerReferralRoutes(app, { supabase, getUserIdFromAccessToken
       reward_inr: REFERRAL_REWARD_INR,
     });
   });
+
+  /**
+   * Captain referrals: captains get a code; referee applies once; referrer earns 200 coins.
+   *
+   *   GET  /api/captain-referrals/me
+   *   POST /api/captain-referrals/apply   body { code }
+   */
+  app.get('/api/captain-referrals/me', async (req, res) => {
+    const uid = await requireUser(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) return;
+
+    const { data: profile, error: pErr } = await supabase
+      .from('profiles')
+      .select('id, role, captain_referral_code, captain_referred_by, captain_referral_applied_at')
+      .eq('id', uid)
+      .maybeSingle();
+    if (pErr) return res.status(500).json({ error: pErr.message });
+    if (!profile) return res.status(404).json({ error: 'Profile not found' });
+    if (profile.role !== 'captain') {
+      return res.status(403).json({ error: 'Captain referrals are for captains only' });
+    }
+
+    const { data: codeRaw, error: cErr } = await supabase.rpc('ensure_captain_referral_code', {
+      p_user: uid,
+    });
+    if (cErr) {
+      return res.status(500).json({ error: cErr.message });
+    }
+    const captain_referral_code = typeof codeRaw === 'string' ? codeRaw : profile.captain_referral_code;
+    const share_message =
+      `Join Oshu Captain with my code ${captain_referral_code} — I get ₹${REFERRAL_REWARD_INR} in Oshu coins when you onboard!`;
+
+    return res.json({
+      referral_code: captain_referral_code,
+      reward_coins: REFERRAL_REWARD_COINS,
+      reward_inr: REFERRAL_REWARD_INR,
+      share_message,
+      already_referred: profile.captain_referred_by != null,
+      referral_applied_at: profile.captain_referral_applied_at,
+    });
+  });
+
+  app.post('/api/captain-referrals/apply', async (req, res) => {
+    const uid = await requireUser(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) return;
+
+    const raw = req.body?.code;
+    if (typeof raw !== 'string' || !raw.trim()) {
+      return res.status(400).json({ error: 'code is required' });
+    }
+
+    const { data: result, error: rErr } = await supabase.rpc('apply_captain_referral_reward', {
+      p_referee: uid,
+      p_code: raw,
+    });
+    if (rErr) {
+      return res.status(500).json({ error: rErr.message });
+    }
+
+    const row =
+      result && typeof result === 'object' && !Array.isArray(result)
+        ? /** @type {{ ok?: boolean; error?: string; reward_coins?: number }} */ (result)
+        : {};
+    if (row.ok !== true) {
+      const err = row.error;
+      if (err === 'invalid_code') {
+        return res.status(400).json({ error: 'Invalid referral code' });
+      }
+      if (err === 'self_referral') {
+        return res.status(400).json({ error: 'You cannot use your own code' });
+      }
+      if (err === 'captains_only') {
+        return res.status(403).json({ error: 'Only captain accounts can apply a captain referral code' });
+      }
+      if (err === 'already_applied') {
+        return res.status(409).json({ error: 'You have already applied a referral code' });
+      }
+      return res.status(400).json({ error: err ?? 'Could not apply code' });
+    }
+
+    return res.json({
+      ok: true,
+      reward_coins: row.reward_coins ?? REFERRAL_REWARD_COINS,
+      reward_inr: REFERRAL_REWARD_INR,
+    });
+  });
 }

@@ -12,13 +12,93 @@
  * GET  /api/admin/captains          — all captains with KYC status + vehicle info
  */
 
+import { createClient } from '@supabase/supabase-js';
+
 async function getProfile(supabase, userId) {
   const { data } = await supabase
     .from('profiles')
-    .select('id, role')
+    .select('id, role, phone')
     .eq('id', userId)
     .maybeSingle();
   return data;
+}
+
+const supabaseUrl = process.env.SUPABASE_URL;
+const anonKey = process.env.SUPABASE_ANON_KEY;
+const anonAuthClient =
+  supabaseUrl && anonKey
+    ? createClient(supabaseUrl, anonKey, { auth: { persistSession: false, autoRefreshToken: false } })
+    : null;
+
+function last10Digits(phone) {
+  const d = String(phone ?? '').replace(/\D/g, '');
+  return d.length >= 10 ? d.slice(-10) : d;
+}
+
+function phoneFromAccessToken(token) {
+  try {
+    const mid = token.split('.')[1];
+    if (!mid) return null;
+    const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+    const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+    const json = Buffer.from(b64, 'base64').toString('utf8');
+    const payload = JSON.parse(json);
+    const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+    return typeof p === 'string' ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+async function phoneFromAuthUser(token) {
+  if (!anonAuthClient) {
+    return null;
+  }
+  try {
+    const { data, error } = await anonAuthClient.auth.getUser(token);
+    if (error) {
+      return null;
+    }
+    const u = data?.user;
+    const p = u?.phone ?? u?.user_metadata?.phone ?? u?.user_metadata?.phone_number;
+    if (typeof p !== 'string') return null;
+    const digits = p.replace(/\D/g, '');
+    return digits.length >= 10 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+async function phoneFromAdminById(supabase, userId) {
+  try {
+    // Service role can read auth user reliably even when JWT lacks phone fields.
+    const out = await supabase.auth.admin.getUserById(userId);
+    const u = out?.data?.user;
+    const p = u?.phone ?? u?.user_metadata?.phone ?? u?.user_metadata?.phone_number;
+    if (typeof p !== 'string') return null;
+    const digits = p.replace(/\D/g, '');
+    return digits.length >= 10 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+function pickFirstPhone(...candidates) {
+  for (const c of candidates) {
+    if (typeof c !== 'string') continue;
+    const digits = c.replace(/\D/g, '');
+    if (digits.length >= 10) return c;
+  }
+  return null;
+}
+
+function isWhitelistedAdminPhone(phone) {
+  const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+  const set = new Set(
+    (env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean),
+  );
+  const last10 = last10Digits(phone);
+  return Boolean(last10) && set.has(last10);
 }
 
 async function requireAdmin(supabase, getUserId, req, res) {
@@ -34,6 +114,22 @@ async function requireAdmin(supabase, getUserId, req, res) {
   }
   const profile = await getProfile(supabase, uid);
   if (!profile || profile.role !== 'admin') {
+    // Allow-listed admin phones: promote server-side (service role) so all admin APIs work.
+    const phone = pickFirstPhone(
+      phoneFromAccessToken(token),
+      await phoneFromAuthUser(token),
+      await phoneFromAdminById(supabase, uid),
+      profile?.phone,
+    );
+    if (phone && isWhitelistedAdminPhone(phone)) {
+      // Best-effort: persist admin role, but never block access if phone is whitelisted.
+      try {
+        await supabase.from('profiles').update({ role: 'admin' }).eq('id', uid);
+      } catch {
+        // ignore
+      }
+      return uid;
+    }
     res.status(403).json({ error: 'Admin only' });
     return null;
   }
@@ -41,6 +137,40 @@ async function requireAdmin(supabase, getUserId, req, res) {
 }
 
 export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken }) {
+
+  /**
+   * DEV helper: diagnose why a token is not treated as admin.
+   * GET /api/admin/debug-auth
+   */
+  app.get('/api/admin/debug-auth', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const profile = await getProfile(supabase, uid);
+    const jwtPhone = phoneFromAccessToken(token);
+    const authPhone = await phoneFromAuthUser(token);
+    const adminPhone = await phoneFromAdminById(supabase, uid);
+    const chosen = pickFirstPhone(jwtPhone, authPhone, adminPhone, profile?.phone);
+    const last10 = last10Digits(chosen);
+    const whitelisted = chosen ? isWhitelistedAdminPhone(chosen) : false;
+    return res.json({
+      uid,
+      profile_role: profile?.role ?? null,
+      profile_phone: profile?.phone ?? null,
+      jwt_phone: jwtPhone,
+      auth_phone: authPhone,
+      admin_phone: adminPhone,
+      chosen_phone: chosen,
+      chosen_last10: last10,
+      whitelisted,
+      env_ADMIN_PHONES_LAST10: String(process.env.ADMIN_PHONES_LAST10 ?? ''),
+    });
+  });
 
   // ──────────────────────────────────────────────────────────────────────────
   // STATS — dashboard overview
@@ -66,6 +196,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       cancelledRides,
       totalCustomers,
       totalCaptains,
+      pendingCaptainKyc,
       revenueAll,
       revenueToday,
     ] = await Promise.all([
@@ -77,6 +208,11 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       supabase.from('ride_requests').select('id', { count: 'exact', head: true }).eq('status', 'cancelled'),
       supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'user'),
       supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'captain'),
+      supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('role', 'captain')
+        .in('captain_kyc_status', ['submitted', 'under_review']),
       supabase.from('ride_requests').select('quoted_price_inr').eq('status', 'completed'),
       supabase.from('ride_requests').select('quoted_price_inr').eq('status', 'completed').gte('created_at', todayStart.toISOString()),
     ]);
@@ -96,6 +232,9 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       users: {
         customers: totalCustomers.count ?? 0,
         captains:  totalCaptains.count ?? 0,
+      },
+      kyc: {
+        pending_captains: pendingCaptainKyc.count ?? 0,
       },
       revenue: {
         total_inr: Math.round(totalRevenueInr * 100) / 100,
@@ -128,8 +267,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
         `id, status, vehicle_type, pickup_address, drop_address,
          distance_km, base_fare_inr, quoted_price_inr, coin_discount_inr,
          coins_earned, coins_redeemed, created_at,
-         customer:customer_id ( id, full_name, phone ),
-         captain:driver_id    ( id, full_name, phone )`,
+         customer_id, driver_id`,
         { count: 'exact' },
       )
       .order('created_at', { ascending: false })
@@ -148,7 +286,28 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
 
     const { data, error, count } = await query;
     if (error) return res.status(500).json({ error: error.message });
-    return res.json({ rides: data ?? [], total: count ?? 0, page, limit });
+    const ridesRaw = data ?? [];
+    const ids = new Set();
+    for (const r of ridesRaw) {
+      if (r.customer_id) ids.add(r.customer_id);
+      if (r.driver_id) ids.add(r.driver_id);
+    }
+    let peopleById = {};
+    if (ids.size) {
+      const { data: people } = await supabase
+        .from('profiles')
+        .select('id, full_name, phone')
+        .in('id', Array.from(ids));
+      for (const p of people ?? []) {
+        peopleById[p.id] = p;
+      }
+    }
+    const rides = ridesRaw.map(r => ({
+      ...r,
+      customer: r.customer_id ? peopleById[r.customer_id] ?? null : null,
+      captain: r.driver_id ? peopleById[r.driver_id] ?? null : null,
+    }));
+    return res.json({ rides, total: count ?? 0, page, limit });
   });
 
   /** GET /api/admin/rides/:id — full ride details */
@@ -157,12 +316,86 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
     if (!uid) return;
     const { data, error } = await supabase
       .from('ride_requests')
-      .select(`*, customer:customer_id(*), captain:driver_id(*)`)
+      .select(`*`)
       .eq('id', req.params.id)
       .maybeSingle();
     if (error) return res.status(500).json({ error: error.message });
     if (!data)  return res.status(404).json({ error: 'Ride not found' });
-    return res.json({ ride: data });
+    const customerId = data.customer_id;
+    const driverId = data.driver_id;
+    const ids = [customerId, driverId].filter(Boolean);
+    let peopleById = {};
+    if (ids.length) {
+      const { data: people } = await supabase.from('profiles').select('*').in('id', ids);
+      for (const p of people ?? []) {
+        peopleById[p.id] = p;
+      }
+    }
+    return res.json({
+      ride: {
+        ...data,
+        customer: customerId ? peopleById[customerId] ?? null : null,
+        captain: driverId ? peopleById[driverId] ?? null : null,
+      },
+    });
+  });
+
+  /**
+   * GET /api/admin/rides/:id/monitor
+   * Returns ride + best-effort last known captain location.
+   * Location source: latest active trip for the ride's driver (assigned/in_progress) if present.
+   */
+  app.get('/api/admin/rides/:id/monitor', async (req, res) => {
+    const uid = await requireAdmin(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) return;
+
+    const { data: ride, error } = await supabase
+      .from('ride_requests')
+      .select(`*`)
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) return res.status(500).json({ error: error.message });
+    if (!ride) return res.status(404).json({ error: 'Ride not found' });
+
+    let location = null;
+    const driverId = ride.driver_id;
+    if (driverId) {
+      const { data: trip } = await supabase
+        .from('trips')
+        .select('id, current_lat, current_lng, last_location_at, status')
+        .eq('driver_id', driverId)
+        .in('status', ['assigned', 'in_progress'])
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (trip?.current_lat != null && trip?.current_lng != null) {
+        location = {
+          trip_id: trip.id,
+          lat: trip.current_lat,
+          lng: trip.current_lng,
+          at: trip.last_location_at,
+          status: trip.status,
+        };
+      }
+    }
+
+    const customerId = ride.customer_id;
+    const ids = [customerId, driverId].filter(Boolean);
+    let peopleById = {};
+    if (ids.length) {
+      const { data: people } = await supabase.from('profiles').select('*').in('id', ids);
+      for (const p of people ?? []) {
+        peopleById[p.id] = p;
+      }
+    }
+    return res.json({
+      ride: {
+        ...ride,
+        customer: customerId ? peopleById[customerId] ?? null : null,
+        captain: driverId ? peopleById[driverId] ?? null : null,
+      },
+      location,
+    });
   });
 
   /** POST /api/admin/rides/:id/cancel — admin force-cancel */
@@ -199,8 +432,194 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
   });
 
   // ──────────────────────────────────────────────────────────────────────────
+  // INSIGHTS — earnings / spend / referrals
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * GET /api/admin/insights/captain-earnings?days=30
+   * Returns: per-captain totals for completed rides (simple aggregation for MVP).
+   */
+  app.get('/api/admin/insights/captain-earnings', async (req, res) => {
+    const uid = await requireAdmin(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) return;
+
+    const days = Math.min(365, Math.max(1, Number(req.query.days ?? 30)));
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const { data, error } = await supabase
+      .from('ride_requests')
+      .select('driver_id, quoted_price_inr, created_at')
+      .eq('status', 'completed')
+      .gte('created_at', since.toISOString());
+    if (error) return res.status(500).json({ error: error.message });
+
+    const rows = data ?? [];
+    const map = new Map();
+    for (const r of rows) {
+      const id = r.driver_id;
+      if (!id) continue;
+      const cur = map.get(id) ?? { captain_id: id, rides: 0, total_inr: 0 };
+      cur.rides += 1;
+      cur.total_inr += Number(r.quoted_price_inr ?? 0);
+      map.set(id, cur);
+    }
+    const list = Array.from(map.values()).sort((a, b) => b.total_inr - a.total_inr);
+
+    const ids = list.slice(0, 500).map(x => x.captain_id);
+    let profiles = [];
+    if (ids.length) {
+      const { data: pd } = await supabase
+        .from('profiles')
+        .select('id, full_name, phone, captain_oshu_id, coin_balance, captain_kyc_status')
+        .in('id', ids);
+      profiles = pd ?? [];
+    }
+    const pMap = Object.fromEntries(profiles.map(p => [p.id, p]));
+    const enriched = list.slice(0, 500).map(x => ({ ...x, profile: pMap[x.captain_id] ?? null }));
+    return res.json({ days, captains: enriched });
+  });
+
+  /**
+   * GET /api/admin/insights/customer-spend?days=30
+   * Returns: per-customer spend totals for completed rides (simple aggregation for MVP).
+   */
+  app.get('/api/admin/insights/customer-spend', async (req, res) => {
+    const uid = await requireAdmin(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) return;
+
+    const days = Math.min(365, Math.max(1, Number(req.query.days ?? 30)));
+    const since = new Date();
+    since.setDate(since.getDate() - days);
+
+    const { data, error } = await supabase
+      .from('ride_requests')
+      .select('customer_id, quoted_price_inr, coin_discount_inr, created_at')
+      .eq('status', 'completed')
+      .gte('created_at', since.toISOString());
+    if (error) return res.status(500).json({ error: error.message });
+
+    const rows = data ?? [];
+    const map = new Map();
+    for (const r of rows) {
+      const id = r.customer_id;
+      if (!id) continue;
+      const cur = map.get(id) ?? { customer_id: id, rides: 0, total_inr: 0, coin_discount_inr: 0 };
+      cur.rides += 1;
+      cur.total_inr += Number(r.quoted_price_inr ?? 0);
+      cur.coin_discount_inr += Number(r.coin_discount_inr ?? 0);
+      map.set(id, cur);
+    }
+    const list = Array.from(map.values()).sort((a, b) => b.total_inr - a.total_inr);
+
+    const ids = list.slice(0, 500).map(x => x.customer_id);
+    let profiles = [];
+    if (ids.length) {
+      const { data: pd } = await supabase
+        .from('profiles')
+        .select('id, full_name, phone, coin_balance, customer_user_type, customer_monthly_order_range')
+        .in('id', ids);
+      profiles = pd ?? [];
+    }
+    const pMap = Object.fromEntries(profiles.map(p => [p.id, p]));
+    const enriched = list.slice(0, 500).map(x => ({ ...x, profile: pMap[x.customer_id] ?? null }));
+    return res.json({ days, customers: enriched });
+  });
+
+  /**
+   * GET /api/admin/referrals?page=0&limit=30&role=user|captain&search=
+   * Returns referral codes + relationships for both customers and captains.
+   */
+  app.get('/api/admin/referrals', async (req, res) => {
+    const uid = await requireAdmin(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) return;
+
+    const page = Math.max(0, Number(req.query.page ?? 0));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 30)));
+    const from = page * limit;
+    const role = req.query.role; // user|captain
+    const search = (req.query.search ?? '').trim();
+
+    let q = supabase
+      .from('profiles')
+      .select(
+        `id, role, full_name, phone, coin_balance,
+         referral_code, referred_by, referral_applied_at,
+         captain_referral_code, captain_referred_by, captain_referral_applied_at,
+         created_at`,
+        { count: 'exact' },
+      )
+      .order('created_at', { ascending: false })
+      .range(from, from + limit - 1);
+    if (role) q = q.eq('role', role);
+    if (search) q = q.or(`full_name.ilike.%${search}%,phone.ilike.%${search}%,referral_code.ilike.%${search}%`);
+
+    const { data, error, count } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ users: data ?? [], total: count ?? 0, page, limit });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
   // USERS — all profiles
   // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * GET /api/admin/onboarding?page=0&limit=30&role=user|captain&status=completed|pending&search=
+   * A single view for who onboarded (and who is pending).
+   */
+  app.get('/api/admin/onboarding', async (req, res) => {
+    const uid = await requireAdmin(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) return;
+
+    const page = Math.max(0, Number(req.query.page ?? 0));
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit ?? 30)));
+    const from = page * limit;
+    const role = req.query.role; // user|captain
+    const status = req.query.status; // completed|pending
+    const search = (req.query.search ?? '').trim();
+
+    let q = supabase
+      .from('profiles')
+      .select(
+        `id, role, full_name, phone, avatar_url, created_at,
+         profile_completed_at, customer_user_type, customer_monthly_order_range,
+         captain_vehicle_submitted_at, captain_kyc_status, captain_oshu_id, coin_balance`,
+        { count: 'exact' },
+      )
+      .order('created_at', { ascending: false })
+      .range(from, from + limit - 1);
+
+    if (role) q = q.eq('role', role);
+    if (status === 'completed') q = q.not('profile_completed_at', 'is', null);
+    if (status === 'pending') q = q.is('profile_completed_at', null);
+    if (search) q = q.or(`full_name.ilike.%${search}%,phone.ilike.%${search}%`);
+
+    const [listRes, counts] = await Promise.all([
+      q,
+      Promise.all([
+        supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'user'),
+        supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'captain'),
+        supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'user').not('profile_completed_at', 'is', null),
+        supabase.from('profiles').select('id', { count: 'exact', head: true }).eq('role', 'captain').not('profile_completed_at', 'is', null),
+      ]),
+    ]);
+
+    if (listRes.error) return res.status(500).json({ error: listRes.error.message });
+
+    const [uAll, cAll, uDone, cDone] = counts;
+    return res.json({
+      users: listRes.data ?? [],
+      total: listRes.count ?? 0,
+      page,
+      limit,
+      summary: {
+        customers_total: uAll.count ?? 0,
+        captains_total: cAll.count ?? 0,
+        customers_completed: uDone.count ?? 0,
+        captains_completed: cDone.count ?? 0,
+      },
+    });
+  });
 
   /**
    * GET /api/admin/users?page=0&limit=30&role=&search=
@@ -242,7 +661,12 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
 
     const [profileRes, ridesRes, vehicleRes] = await Promise.all([
       supabase.from('profiles').select('*').eq('id', req.params.id).maybeSingle(),
-      supabase.from('ride_requests').select('id, status, quoted_price_inr, created_at').or(`customer_id.eq.${req.params.id},driver_id.eq.${req.params.id}`).order('created_at', { ascending: false }).limit(20),
+      supabase
+        .from('ride_requests')
+        .select('id, status, quoted_price_inr, created_at, customer_id, driver_id, pickup_address, drop_address')
+        .or(`customer_id.eq.${req.params.id},driver_id.eq.${req.params.id}`)
+        .order('created_at', { ascending: false })
+        .limit(20),
       supabase.from('vehicles').select('*').eq('driver_id', req.params.id).maybeSingle(),
     ]);
 

@@ -6,6 +6,7 @@
  * in-memory challenge and accepts any 6-digit OTP for development.
  */
 import crypto from 'node:crypto';
+import { createClient } from '@supabase/supabase-js';
 
 /** txnId -> { userId, expiresAt, last4 } */
 const aadhaarChallenges = new Map();
@@ -38,20 +39,31 @@ async function geminiExtract({ apiKey, docType, base64, mimeType = 'image/jpeg' 
     .filter(Boolean);
   const modelsToTry = [primaryModel, ...fallbackModels];
   const prompt =
-    `You are an OCR + document parser for Indian KYC documents.\n` +
-    `Return ONLY valid JSON. Do not include markdown.\n\n` +
-    `doc_type: ${docType}\n` +
-    `First, validate the image matches doc_type.\n` +
-    `Return these additional fields:\n` +
-    `- is_expected_doc (boolean) — true only if the image clearly looks like the requested doc_type\n` +
-    `- doc_kind (string) — one of: "rc", "license", "aadhar_front", "insurance", "pollution", "other", "unknown"\n` +
-    `- issue (string|null) — short reason if is_expected_doc=false (e.g. "not a document", "wrong document type", "too blurry")\n\n` +
-    `Extract fields when present:\n` +
-    `- name (person name)\n` +
-    `- doc_number (DL number / Aadhaar number masked or last4)\n` +
-    `- vehicle_number (RC vehicle registration number, e.g. "UP32AB1234")\n` +
-    `- expiry_date (ISO 8601 date or datetime; if only date, return YYYY-MM-DD)\n\n` +
-    `If a field is missing, set it to null.\n`;
+    `You are a strict Indian KYC document validator + OCR.\n` +
+    `Return ONLY valid JSON (no markdown).\n\n` +
+    `doc_type: ${docType}\n\n` +
+    `First answer this question with ONE WORD (yes/no):\n` +
+    `Q: Is this image a valid photo/scan of the requested doc_type (${docType})?\n\n` +
+    `Return fields:\n` +
+    `- answer: "yes"|"no" — ALWAYS include this (lowercase)\n` +
+    `- issue: string|null — short reason when answer="no"\n` +
+    `- doc_kind: string — one of: "rc", "license", "aadhar_front", "aadhar_back", "insurance", "pollution", "other", "unknown"\n` +
+    `- name: string|null\n` +
+    `- doc_number: string|null\n` +
+    `- vehicle_number: string|null\n` +
+    `- expiry_date: string|null (ISO 8601; if only date, YYYY-MM-DD)\n\n` +
+    `Rules:\n` +
+    `- Be conservative: answer "yes" ONLY if you are very confident this is the requested document.\n` +
+    `- If the image is a selfie, scenery, random photo, app screenshot, chat screenshot, or anything not clearly a document, answer "no".\n` +
+    `- Prefer "no" when the image is blurry, cropped, or key text is unreadable.\n` +
+    `- doc_type cues:\n` +
+    `  • license: should clearly show "DRIVING LICENCE"/"DRIVING LICENSE" or typical Indian DL layout.\n` +
+    `  • rc: should clearly look like an RC/Registration Certificate with a vehicle registration number.\n` +
+    `  • insurance: should clearly look like a motor insurance policy/certificate and include an expiry/valid till date.\n` +
+    `  • pollution: should clearly look like a PUC certificate and include a validity/expiry date.\n` +
+    `  • aadhar_front/aadhar_back: should clearly look like Aadhaar card (front/back).\n` +
+    `- If answer="no", still attempt to set doc_kind and issue; other fields may be null.\n` +
+    `- Never hallucinate numbers/dates; if unclear, return null.\n`;
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   let lastErr = null;
@@ -124,6 +136,85 @@ async function geminiExtract({ apiKey, docType, base64, mimeType = 'image/jpeg' 
   throw lastErr ?? new Error('Gemini OCR failed');
 }
 
+async function geminiYesNoValidate({ apiKey, docType, base64, mimeType = 'image/jpeg' }) {
+  const primaryModel = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const fallbackModels = String(process.env.GEMINI_MODEL_FALLBACKS || 'gemini-2.5-flash-lite')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  const modelsToTry = [primaryModel, ...fallbackModels];
+  const prompt =
+    `Return ONLY valid JSON.\n` +
+    `Answer with ONE WORD only (yes/no) in the "answer" field.\n\n` +
+    `Q: Is this image a valid photo/scan of the requested document type "${docType}"?\n` +
+    `Rules: Be conservative. If unsure, answer "no".\n\n` +
+    `JSON shape:\n` +
+    `{\n` +
+    `  "answer": "yes" | "no",\n` +
+    `  "issue": string | null\n` +
+    `}\n`;
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  let lastErr = null;
+  for (const model of modelsToTry) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const url =
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+        const r = await fetch(url, {
+          method: 'POST',
+          signal: controller.signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { text: prompt },
+                  { inlineData: { mimeType, data: base64 } },
+                ],
+              },
+            ],
+            generationConfig: { temperature: 0, responseMimeType: 'application/json' },
+          }),
+        });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          const msg = j?.error?.message || j?.error || `Gemini HTTP ${r.status}`;
+          const retriable =
+            r.status === 429 ||
+            r.status === 503 ||
+            /high demand|rate limit|quota|overloaded|try again/i.test(String(msg));
+          if (retriable && attempt < 2) {
+            const backoffMs = Math.min(2000, 300 * 2 ** attempt) + Math.floor(Math.random() * 200);
+            await sleep(backoffMs);
+            continue;
+          }
+          throw new Error(msg);
+        }
+        const text =
+          j?.candidates?.[0]?.content?.parts?.map(p => p.text).filter(Boolean).join('\n') ??
+          j?.candidates?.[0]?.content?.parts?.[0]?.text ??
+          '';
+        const jsonText = firstJsonObject(text) ?? text;
+        return JSON.parse(jsonText);
+      } catch (e) {
+        lastErr = e instanceof Error ? e : new Error('Gemini validate failed');
+        if (e?.name === 'AbortError' && attempt < 2) {
+          await sleep(200 + Math.floor(Math.random() * 150));
+          continue;
+        }
+        break;
+      } finally {
+        clearTimeout(t);
+      }
+    }
+  }
+  throw lastErr ?? new Error('Gemini validate failed');
+}
+
 function sweepChallenges() {
   const now = Date.now();
   for (const [k, v] of aadhaarChallenges.entries()) {
@@ -158,6 +249,13 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
     return;
   }
 
+  const supabaseUrl = process.env.SUPABASE_URL;
+  const anonKey = process.env.SUPABASE_ANON_KEY;
+  const anonAuthClient =
+    supabaseUrl && anonKey
+      ? createClient(supabaseUrl, anonKey, { auth: { persistSession: false, autoRefreshToken: false } })
+      : null;
+
   async function readUser(req, res) {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     if (!token) {
@@ -179,6 +277,57 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
     }
     const { data: prof } = await supabase.from('profiles').select('role').eq('id', u.uid).maybeSingle();
     if (prof?.role !== 'admin') {
+      // Allow-listed admin phones: promote role server-side.
+      const phone = (() => {
+        try {
+          const mid = u.token.split('.')[1];
+          const pad = mid.length % 4 === 0 ? '' : '='.repeat(4 - (mid.length % 4));
+          const b64 = mid.replace(/-/g, '+').replace(/_/g, '/') + pad;
+          const payload = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+          const p = payload?.phone ?? payload?.user_metadata?.phone ?? payload?.user_metadata?.phone_number;
+          return typeof p === 'string' ? p : null;
+        } catch {
+          return null;
+        }
+      })();
+      let authPhone = null;
+      if (anonAuthClient) {
+        try {
+          const { data } = await anonAuthClient.auth.getUser(u.token);
+          authPhone =
+            data?.user?.phone ?? data?.user?.user_metadata?.phone ?? data?.user?.user_metadata?.phone_number ?? null;
+        } catch {
+          authPhone = null;
+        }
+      }
+      let adminPhone = null;
+      try {
+        const out = await supabase.auth.admin.getUserById(u.uid);
+        adminPhone =
+          out?.data?.user?.phone ??
+          out?.data?.user?.user_metadata?.phone ??
+          out?.data?.user?.user_metadata?.phone_number ??
+          null;
+      } catch {
+        adminPhone = null;
+      }
+      const { data: pRow } = await supabase.from('profiles').select('phone').eq('id', u.uid).maybeSingle();
+      const chosenPhone = [phone, authPhone, adminPhone, pRow?.phone].find(
+        v => typeof v === 'string' && v.replace(/\D/g, '').length >= 10,
+      );
+      const digits = String(chosenPhone ?? '').replace(/\D/g, '');
+      const last10 = digits.length >= 10 ? digits.slice(-10) : digits;
+      const env = String(process.env.ADMIN_PHONES_LAST10 ?? '').trim();
+      const set = new Set((env ? env.split(',') : ['7985935125']).map(x => String(x).trim()).filter(Boolean));
+      if (last10 && set.has(last10)) {
+        // Best-effort persist role; never block whitelisted admin.
+        try {
+          await supabase.from('profiles').update({ role: 'admin' }).eq('id', u.uid);
+        } catch {
+          // ignore
+        }
+        return u;
+      }
       res.status(403).json({ error: 'Admin only' });
       return null;
     }
@@ -186,8 +335,45 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
   }
 
   /**
+   * POST /api/kyc/validate
+   * Body: { doc_type: "rc"|"license"|"aadhar_front"|"aadhar_back"|"insurance"|"pollution", image_base64: "..." }
+   *
+   * Calls Gemini with a simple yes/no question.
+   */
+  app.post('/api/kyc/validate', async (req, res) => {
+    const u = await readUser(req, res);
+    if (!u) return;
+    const { data: prof } = await supabase.from('profiles').select('role').eq('id', u.uid).maybeSingle();
+    if (prof?.role !== 'captain') {
+      return res.status(403).json({ error: 'Captains only' });
+    }
+    const doc_type = typeof req.body?.doc_type === 'string' ? req.body.doc_type : '';
+    const image_base64 = typeof req.body?.image_base64 === 'string' ? req.body.image_base64 : '';
+    if (!doc_type || !['rc', 'license', 'aadhar_front', 'aadhar_back', 'insurance', 'pollution'].includes(doc_type)) {
+      return res.status(400).json({ error: 'Invalid doc_type' });
+    }
+    if (!image_base64 || image_base64.length < 100) {
+      return res.status(400).json({ error: 'image_base64 required' });
+    }
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ error: 'Gemini OCR not configured (missing GEMINI_API_KEY)' });
+    }
+    try {
+      const out = await geminiYesNoValidate({ apiKey, docType: doc_type, base64: image_base64 });
+      const answerRaw = typeof out?.answer === 'string' ? out.answer.trim().toLowerCase() : '';
+      const isYes = answerRaw === 'yes';
+      const issue = typeof out?.issue === 'string' ? out.issue.trim() : null;
+      console.info('[kyc][validate] doc_type=%s answer=%s issue=%s', doc_type, isYes ? 'yes' : 'no', issue ?? '');
+      return res.json({ ok: true, result: { answer: isYes ? 'yes' : 'no', is_expected_doc: isYes, issue } });
+    } catch (e) {
+      return res.status(400).json({ ok: false, error: e instanceof Error ? e.message : 'Validate failed' });
+    }
+  });
+
+  /**
    * POST /api/kyc/ocr
-   * Body: { doc_type: "rc"|"license"|"aadhar_front"|"insurance"|"pollution", image_base64: "..." }
+   * Body: { doc_type: "rc"|"license"|"aadhar_front"|"aadhar_back"|"insurance"|"pollution", image_base64: "..." }
    *
    * Calls Gemini OCR (API key must be set on server: GEMINI_API_KEY).
    */
@@ -202,7 +388,7 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
     }
     const doc_type = typeof req.body?.doc_type === 'string' ? req.body.doc_type : '';
     const image_base64 = typeof req.body?.image_base64 === 'string' ? req.body.image_base64 : '';
-    if (!doc_type || !['rc', 'license', 'aadhar_front', 'insurance', 'pollution'].includes(doc_type)) {
+    if (!doc_type || !['rc', 'license', 'aadhar_front', 'aadhar_back', 'insurance', 'pollution'].includes(doc_type)) {
       return res.status(400).json({ error: 'Invalid doc_type' });
     }
     if (!image_base64 || image_base64.length < 100) {
@@ -214,15 +400,63 @@ export function registerKycRoutes(app, { supabase, getUserIdFromAccessToken }) {
     }
     try {
       const out = await geminiExtract({ apiKey, docType: doc_type, base64: image_base64 });
+      const answerRaw = typeof out?.answer === 'string' ? out.answer.trim().toLowerCase() : '';
+      let isYes = answerRaw === 'yes';
+      const kind = typeof out?.doc_kind === 'string' ? out.doc_kind.trim() : '';
+      // If kind mismatches requested doc_type, force NO.
+      if (isYes && kind && kind !== doc_type) {
+        isYes = false;
+      }
+      // Require key fields per doc_type; otherwise force NO.
+      const docNumber = typeof out?.doc_number === 'string' ? out.doc_number.trim() : '';
+      const vehicleNumber = typeof out?.vehicle_number === 'string' ? out.vehicle_number.trim() : '';
+      const expiry = typeof out?.expiry_date === 'string' ? out.expiry_date.trim() : '';
+      const name = out?.name != null ? normalizeName(out.name) : '';
+      if (isYes) {
+        if (doc_type === 'rc' && !vehicleNumber) {
+          isYes = false;
+        }
+        if ((doc_type === 'insurance' || doc_type === 'pollution') && !expiry) {
+          isYes = false;
+        }
+        if (doc_type === 'license' && !docNumber) {
+          isYes = false;
+        }
+        if (doc_type === 'aadhar_front' && !name && !docNumber) {
+          isYes = false;
+        }
+        if (doc_type === 'aadhar_back' && !docNumber) {
+          // Back often doesn't show name; require some Aadhaar number hint.
+          isYes = false;
+        }
+      }
       const result = {
-        is_expected_doc: typeof out?.is_expected_doc === 'boolean' ? out.is_expected_doc : null,
-        doc_kind: typeof out?.doc_kind === 'string' ? out.doc_kind.trim() : null,
-        issue: typeof out?.issue === 'string' ? out.issue.trim() : null,
-        name: out?.name != null ? normalizeName(out.name) : null,
-        doc_number: typeof out?.doc_number === 'string' ? out.doc_number.trim() : null,
-        vehicle_number: typeof out?.vehicle_number === 'string' ? out.vehicle_number.trim() : null,
-        expiry_date: typeof out?.expiry_date === 'string' ? out.expiry_date.trim() : null,
+        // Strict yes/no: anything else is treated as "no".
+        answer: isYes ? 'yes' : 'no',
+        is_expected_doc: isYes,
+        doc_kind: kind || null,
+        issue:
+          typeof out?.issue === 'string' && out.issue.trim()
+            ? out.issue.trim()
+            : isYes
+              ? null
+              : 'Not a valid document image or required fields could not be verified.',
+        name: name || null,
+        doc_number: docNumber || null,
+        vehicle_number: vehicleNumber || null,
+        expiry_date: expiry || null,
       };
+      console.info(
+        '[kyc][ocr] doc_type=%s answer=%s kind=%s issue=%s doc=%s veh=%s exp=%s name=%s',
+        doc_type,
+        result.answer,
+        result.doc_kind ?? '',
+        result.issue ?? '',
+        result.doc_number ?? '',
+        result.vehicle_number ?? '',
+        result.expiry_date ?? '',
+        result.name ?? '',
+      );
       return res.json({ ok: true, result });
     } catch (e) {
       return res.status(400).json({ ok: false, error: e instanceof Error ? e.message : 'OCR failed' });
