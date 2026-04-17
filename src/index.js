@@ -125,13 +125,16 @@ app.get('/db/health', async (_req, res) => {
   return res.json({ ok: true, supabase: true });
 });
 
+/** Dev-only routes: mounted at `/dev/*` and `/api/dev/*` so reverse proxies that only forward `/api/*` still work. */
+const devRouter = express.Router();
+
 /**
  * Dev only (__DEV__ app): mint session on the server so the Android emulator never calls
  * Supabase Auth over HTTPS (RN often throws "Network request failed" on verifyOtp).
  * Returns access_token + refresh_token for supabase.auth.setSession() on the client.
  * Requires ALLOW_DEV_OTP_BYPASS=true and SUPABASE_ANON_KEY in .env
  */
-app.post('/dev/phone-session', async (req, res) => {
+devRouter.post('/phone-session', async (req, res) => {
   if (process.env.ALLOW_DEV_OTP_BYPASS !== 'true') {
     return res.status(404).json({ error: 'not found' });
   }
@@ -174,7 +177,7 @@ app.post('/dev/phone-session', async (req, res) => {
 /**
  * Dev: load profile + vehicle from the server so the RN emulator never calls Supabase REST (often "Network request failed").
  */
-app.get('/dev/profile', async (req, res) => {
+devRouter.get('/profile', async (req, res) => {
   if (process.env.ALLOW_DEV_OTP_BYPASS !== 'true' || !supabase) {
     return res.status(404).json({ error: 'not found' });
   }
@@ -208,7 +211,7 @@ app.get('/dev/profile', async (req, res) => {
 /**
  * Dev: set role from the server (same reason as GET /dev/profile).
  */
-app.post('/dev/set-role', async (req, res) => {
+devRouter.post('/set-role', async (req, res) => {
   if (process.env.ALLOW_DEV_OTP_BYPASS !== 'true' || !supabase) {
     return res.status(404).json({ error: 'not found' });
   }
@@ -245,7 +248,7 @@ app.post('/dev/set-role', async (req, res) => {
 /**
  * Dev: one-time customer personalization (same as Supabase profiles update; RN dev proxy).
  */
-app.post('/dev/customer-personalization', async (req, res) => {
+devRouter.post('/customer-personalization', async (req, res) => {
   if (process.env.ALLOW_DEV_OTP_BYPASS !== 'true' || !supabase) {
     return res.status(404).json({ error: 'not found' });
   }
@@ -300,7 +303,7 @@ app.post('/dev/customer-personalization', async (req, res) => {
 /**
  * Dev: captain vehicle step — uploads + DB on server (RN emulator cannot reach Supabase Storage/REST).
  */
-app.post('/dev/captain-vehicle-step', async (req, res) => {
+devRouter.post('/captain-vehicle-step', async (req, res) => {
   if (process.env.ALLOW_DEV_OTP_BYPASS !== 'true' || !supabase) {
     return res.status(404).json({ error: 'not found' });
   }
@@ -406,7 +409,7 @@ app.post('/dev/captain-vehicle-step', async (req, res) => {
 /**
  * Dev: captain KYC documents — uploads + profile update on server.
  */
-app.post('/dev/captain-documents', async (req, res) => {
+devRouter.post('/captain-documents', async (req, res) => {
   if (process.env.ALLOW_DEV_OTP_BYPASS !== 'true' || !supabase) {
     return res.status(404).json({ error: 'not found' });
   }
@@ -487,6 +490,9 @@ app.post('/dev/captain-documents', async (req, res) => {
     return res.status(500).json({ error: e?.message ?? 'upload failed' });
   }
 });
+
+app.use('/dev', devRouter);
+app.use('/api/dev', devRouter);
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
