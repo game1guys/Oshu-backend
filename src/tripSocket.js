@@ -31,8 +31,9 @@ async function assertRideChatParticipant(supabase, rideId, userId) {
   if (error || !ride) {
     return { ok: false, error: 'ride not found' };
   }
-  if (!['accepted', 'in_progress'].includes(ride.status)) {
-    return { ok: false, error: 'chat only after captain accepts' };
+  /** Chat only before trip starts (PIN / in_progress). */
+  if (ride.status !== 'accepted') {
+    return { ok: false, error: 'chat only while waiting to start the trip' };
   }
   if (ride.customer_id === userId) {
     return { ok: true, role: 'customer' };

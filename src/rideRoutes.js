@@ -3,6 +3,7 @@
  */
 
 import { haversineKm } from './geo.js';
+import { fetchDrivingRoutePolyline } from './googleDrivingRoutePolyline.js';
 import { fetchRouteTollEstimateInr } from './googleRouteTollEstimate.js';
 import { awardCoinsForRide } from './coinRoutes.js';
 import { createClient } from '@supabase/supabase-js';
@@ -384,7 +385,8 @@ async function notifyCaptainsNearby(io, supabase, ride) {
   if (!io || !supabase || ride?.pickup_lat == null) {
     return;
   }
-  const staleBefore = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+  /** Match captains who are still “live” for dispatch; keep in sync with client presence cadence. */
+  const staleBefore = new Date(Date.now() - 45 * 60 * 1000).toISOString();
   const { data: presences, error } = await supabase
     .from('captain_presence')
     .select('driver_id, lat, lng')
@@ -1766,6 +1768,49 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       eta_minutes_to_pickup: etaPickup,
       eta_minutes_to_drop: etaDrop,
     });
+  });
+
+  /**
+   * Customer or captain: road polyline from current vehicle position to drop (in-progress trips only).
+   * Uses GOOGLE_MAPS_API_KEY (Routes API). Returns { path: [{latitude,longitude}], ok }.
+   */
+  app.get('/api/rides/:id/driving-route-to-drop', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const id = req.params.id;
+    const { data: row, error } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    if (!row) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (row.customer_id !== uid && row.captain_id !== uid) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (row.status !== 'in_progress') {
+      return res.status(400).json({ error: 'Road route is only available once the trip has started' });
+    }
+    const olat = parseFloat(String(req.query.olat ?? ''));
+    const olng = parseFloat(String(req.query.olng ?? ''));
+    if (Number.isNaN(olat) || Number.isNaN(olng)) {
+      return res.status(400).json({ error: 'olat and olng required' });
+    }
+    if (row.drop_lat == null || row.drop_lng == null) {
+      return res.status(400).json({ error: 'Drop location missing' });
+    }
+    const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ error: 'Routing not configured', path: [], ok: false });
+    }
+    const { path, ok } = await fetchDrivingRoutePolyline(apiKey, olat, olng, row.drop_lat, row.drop_lng);
+    return res.json({ path: ok ? path : [], ok: Boolean(ok && path?.length) });
   });
 
   /** Single ride by id — after all static /api/rides/... paths. */
