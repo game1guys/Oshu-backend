@@ -3,6 +3,7 @@
  */
 
 import { haversineKm } from './geo.js';
+import { fetchRouteTollEstimateInr } from './googleRouteTollEstimate.js';
 import { awardCoinsForRide } from './coinRoutes.js';
 import { createClient } from '@supabase/supabase-js';
 
@@ -928,6 +929,15 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     if (error) {
       return res.status(500).json({ error: error.message });
     }
+    const mapsKey = process.env.GOOGLE_MAPS_API_KEY;
+    const tollPkg = mapsKey
+      ? await fetchRouteTollEstimateInr(mapsKey, { pickup_lat, pickup_lng, drop_lat, drop_lng })
+      : { toll_inr: 0, road_distance_km: null, ok: false };
+    const estimated_route_toll_inr = roundMoney(Number(tollPkg.toll_inr ?? 0));
+    const route_road_distance_km =
+      tollPkg.road_distance_km != null && Number.isFinite(tollPkg.road_distance_km)
+        ? roundMoney(tollPkg.road_distance_km)
+        : null;
     const eligible = rows ?? [];
     const options = eligible.map(row => {
       const base_fare_inr = quoteFromRow(distance_km, row);
@@ -939,7 +949,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         filterWeightKg != null ? filterWeightKg : NaN,
         Number.isFinite(capKg) ? capKg : NaN,
       );
-      const estimated_price_inr = roundMoney(afterDisc + chargeInr);
+      const trip_subtotal_after_overweight_inr = roundMoney(afterDisc + chargeInr);
+      const estimated_price_inr = roundMoney(trip_subtotal_after_overweight_inr + estimated_route_toll_inr);
       return {
         vehicle_type: row.vehicle_type,
         price_per_km_inr: Number(row.price_per_km_inr),
@@ -958,11 +969,15 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
               overweight_rate_inr_per_kg: OVERWEIGHT_INR_PER_KG,
             }
           : {}),
+        estimated_route_toll_inr,
+        trip_subtotal_after_overweight_inr,
         estimated_price_inr,
       };
     });
     return res.json({
       distance_km,
+      estimated_route_toll_inr,
+      route_road_distance_km,
       packaging_fee_inr,
       manpower_fee_inr,
       manpower_helper_inr: manpowerInr,
