@@ -164,7 +164,7 @@ function renderInvoiceHtml({ ride, customer, packaging }) {
     ...(segDiscount > 0 ? [{ label: `Welcome / business offer (${discPct}% on trip + packaging + helper)`, amt: -segDiscount }] : []),
     ...(coinDiscount > 0 ? [{ label: 'Oshu Coins redeemed', amt: -coinDiscount }] : []),
     ...(overtime > 0 ? [{ label: 'Service overtime (after included minutes)', amt: overtime }] : []),
-    ...(toll > 0 ? [{ label: 'Toll (pickup to drop, added at delivery)', amt: toll }] : []),
+    ...(toll > 0 ? [{ label: 'Toll (pickup to drop, at booking)', amt: toll }] : []),
     ...(qrDisc > 0 ? [{ label: `Oshu UPI QR offer (${OSHU_QR_PAY_DISCOUNT_PCT}%)`, amt: -qrDisc }] : []),
   ].filter(x => Math.round(Number(x.amt ?? 0)) !== 0);
 
@@ -1124,9 +1124,15 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       coinsApplied = Math.min(coins_to_redeem, balance, maxByPct);
       coinDiscountInr = coinsApplied;
     }
-    const quoted_price_inr = roundMoney(
+    let quoted_price_inr = roundMoney(
       Math.max(0, subtotal_after_segment_discount - coinDiscountInr) + overweightChargeInr,
     );
+    const mapsKeyCreate = process.env.GOOGLE_MAPS_API_KEY;
+    const tollPkgCreate = mapsKeyCreate
+      ? await fetchRouteTollEstimateInr(mapsKeyCreate, { pickup_lat, pickup_lng, drop_lat, drop_lng })
+      : { toll_inr: 0, road_distance_km: null, ok: false, had_route: false };
+    const tollInrAtBooking = roundMoney(Number(tollPkgCreate.toll_inr ?? 0));
+    quoted_price_inr = roundMoney(quoted_price_inr + tollInrAtBooking);
 
     const svcDefaults = await loadRideServiceDefaults(supabase);
     const handshake_pin = genHandshakePin();
@@ -1162,7 +1168,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         cargo_overweight_kg: cargoOverweightKg,
         overweight_rate_inr_per_kg: OVERWEIGHT_INR_PER_KG,
         overweight_charge_inr: overweightChargeInr,
-        toll_inr: 0,
+        toll_inr: tollInrAtBooking,
         quoted_price_inr,
         preferred_payment_method,
         handshake_pin,
@@ -1213,7 +1219,10 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     return res.json({ rides: data ?? [] });
   });
 
-  /** Captain: pending requests within 5 km of pickup, same vehicle class as yours. */
+  /**
+   * Captain: pending requests, same vehicle class as yours.
+   * With valid `lat`/`lng`, only pickups within DISPATCH_RADIUS_KM; without GPS, all matching pending (no km filter).
+   */
   app.get('/api/rides/pending', async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     if (!token || !supabase) {
@@ -1230,9 +1239,6 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const capLat = parseFloat(String(req.query.lat ?? ''));
     const capLng = parseFloat(String(req.query.lng ?? ''));
     const hasCap = !Number.isNaN(capLat) && !Number.isNaN(capLng);
-    if (!hasCap) {
-      return res.status(400).json({ error: 'lat and lng required for nearby dispatch' });
-    }
     const { data: myVehicle } = await supabase.from('vehicles').select('type').eq('driver_id', uid).maybeSingle();
     if (!myVehicle?.type) {
       return res.status(400).json({ error: 'Register your vehicle before accepting jobs' });
@@ -1257,12 +1263,19 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       if (dismissed.has(r.id)) {
         continue;
       }
-      const km = roundMoney(haversineKm(capLat, capLng, r.pickup_lat, r.pickup_lng));
-      if (km <= DISPATCH_RADIUS_KM) {
-        list.push({ ...r, km_to_pickup: km });
+      if (hasCap) {
+        const km = roundMoney(haversineKm(capLat, capLng, r.pickup_lat, r.pickup_lng));
+        if (km <= DISPATCH_RADIUS_KM) {
+          list.push({ ...r, km_to_pickup: km });
+        }
+      } else {
+        /** No captain GPS: still return same-class pending so the app feed is not empty (distance filter skipped). */
+        list.push({ ...r, km_to_pickup: null });
       }
     }
-    list.sort((a, b) => (a.km_to_pickup ?? 0) - (b.km_to_pickup ?? 0));
+    if (hasCap) {
+      list.sort((a, b) => (a.km_to_pickup ?? 0) - (b.km_to_pickup ?? 0));
+    }
     const sanitized = list.map(r => {
       const x = { ...r };
       delete x.handshake_pin;
@@ -1451,12 +1464,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       overtimeMin = Math.max(0, durationMin - included);
       overtimeCharge = roundMoney(overtimeMin * rate);
     }
-    const tollRaw = req.body?.toll_inr;
-    const tollParsed =
-      tollRaw != null && tollRaw !== '' ? Number(tollRaw) : 0;
-    const tollInr =
-      Number.isFinite(tollParsed) && tollParsed > 0 ? roundMoney(Math.min(tollParsed, 500000)) : 0;
-    const finalPayable = roundMoney(baseFare + overtimeCharge + tollInr);
+    /** `quoted_price_inr` already includes route toll from booking; only overtime is added here. */
+    const finalPayable = roundMoney(baseFare + overtimeCharge);
     const at = end.toISOString();
     const { data, error } = await supabase
       .from('ride_requests')
@@ -1466,7 +1475,6 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         updated_at: at,
         overtime_minutes: overtimeMin,
         overtime_charge_inr: overtimeCharge,
-        toll_inr: tollInr,
         final_payable_inr: finalPayable,
         payment_status: 'awaiting_payment',
       })
@@ -1852,7 +1860,10 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     return res.status(200).send(html);
   });
 
-  /** Customer: cancel pending ride. */
+  /**
+   * Customer: cancel while finding a partner (pending), before trip starts (accepted), or during trip (in_progress).
+   * Captain: cancel an accepted or in-progress job assigned to them.
+   */
   app.post('/api/rides/:id/cancel', async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     if (!token || !supabase) {
@@ -1863,16 +1874,60 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(401).json({ error: 'Invalid token' });
     }
     const profile = await getProfile(supabase, uid);
-    if (!profile || profile.role !== 'user') {
-      return res.status(403).json({ error: 'Customers only' });
+    if (!profile || !['user', 'captain'].includes(profile.role)) {
+      return res.status(403).json({ error: 'Forbidden' });
     }
     const id = req.params.id;
+    const { data: row, error: fetchErr } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (fetchErr) {
+      return res.status(500).json({ error: fetchErr.message });
+    }
+    if (!row) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    if (['completed', 'cancelled'].includes(row.status)) {
+      return res.status(409).json({ error: 'Ride already finished or cancelled' });
+    }
+
+    const at = new Date().toISOString();
+
+    if (profile.role === 'user') {
+      if (row.customer_id !== uid) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+      if (!['pending', 'accepted', 'in_progress'].includes(row.status)) {
+        return res.status(409).json({ error: 'Cannot cancel this ride' });
+      }
+      const { data, error } = await supabase
+        .from('ride_requests')
+        .update({ status: 'cancelled', updated_at: at })
+        .eq('id', id)
+        .eq('customer_id', uid)
+        .in('status', ['pending', 'accepted', 'in_progress'])
+        .select('*')
+        .maybeSingle();
+      if (error) {
+        return res.status(500).json({ error: error.message });
+      }
+      if (!data) {
+        return res.status(409).json({ error: 'Cannot cancel' });
+      }
+      emitRide(io, data);
+      return res.json({ ride: data });
+    }
+
+    if (row.captain_id !== uid) {
+      return res.status(403).json({ error: 'Not your job' });
+    }
+    if (!['accepted', 'in_progress'].includes(row.status)) {
+      return res.status(409).json({ error: 'You can only cancel accepted or in-progress jobs' });
+    }
     const { data, error } = await supabase
       .from('ride_requests')
-      .update({ status: 'cancelled', updated_at: new Date().toISOString() })
+      .update({ status: 'cancelled', updated_at: at })
       .eq('id', id)
-      .eq('customer_id', uid)
-      .eq('status', 'pending')
+      .eq('captain_id', uid)
+      .in('status', ['accepted', 'in_progress'])
       .select('*')
       .maybeSingle();
     if (error) {
