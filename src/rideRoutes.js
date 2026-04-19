@@ -932,12 +932,24 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const mapsKey = process.env.GOOGLE_MAPS_API_KEY;
     const tollPkg = mapsKey
       ? await fetchRouteTollEstimateInr(mapsKey, { pickup_lat, pickup_lng, drop_lat, drop_lng })
-      : { toll_inr: 0, road_distance_km: null, ok: false };
+      : { toll_inr: 0, road_distance_km: null, ok: false, had_route: false };
     const estimated_route_toll_inr = roundMoney(Number(tollPkg.toll_inr ?? 0));
     const route_road_distance_km =
       tollPkg.road_distance_km != null && Number.isFinite(tollPkg.road_distance_km)
         ? roundMoney(tollPkg.road_distance_km)
         : null;
+    let toll_estimate_status = 'missing_key';
+    if (mapsKey) {
+      if (!tollPkg.ok) {
+        toll_estimate_status = 'api_error';
+      } else if (!tollPkg.had_route) {
+        toll_estimate_status = 'no_route';
+      } else if (estimated_route_toll_inr <= 0) {
+        toll_estimate_status = 'no_toll';
+      } else {
+        toll_estimate_status = 'ok';
+      }
+    }
     const eligible = rows ?? [];
     const options = eligible.map(row => {
       const base_fare_inr = quoteFromRow(distance_km, row);
@@ -978,6 +990,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       distance_km,
       estimated_route_toll_inr,
       route_road_distance_km,
+      toll_estimate_status,
       packaging_fee_inr,
       manpower_fee_inr,
       manpower_helper_inr: manpowerInr,
@@ -1044,6 +1057,11 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       typeof b.packaging_type_id === 'string' && b.packaging_type_id.trim() ? b.packaging_type_id.trim() : null;
     const manpower_requested = Boolean(b.manpower_requested);
     const coins_to_redeem = Math.max(0, Math.floor(Number(b.coins_to_redeem ?? 0)));
+    const ppmRaw = b.preferred_payment_method;
+    const preferred_payment_method =
+      typeof ppmRaw === 'string' && ['cod', 'upi', 'oshu_wallet'].includes(ppmRaw.trim())
+        ? ppmRaw.trim()
+        : null;
     const allowedMaterials = new Set(['plastic', 'wood', 'metal', 'mixed', 'other']);
     if (cargo_material && !allowedMaterials.has(cargo_material)) {
       return res.status(400).json({ error: 'Invalid cargo_material' });
@@ -1146,6 +1164,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         overweight_charge_inr: overweightChargeInr,
         toll_inr: 0,
         quoted_price_inr,
+        preferred_payment_method,
         handshake_pin,
         included_service_minutes: svcDefaults.includedMin,
         overtime_inr_per_min: svcDefaults.overtimePerMin,
