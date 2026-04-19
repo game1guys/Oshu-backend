@@ -106,6 +106,12 @@ export function registerPaymentRoutes(app, { supabase, getUserIdFromAccessToken 
     if (ride.payment_status !== 'awaiting_payment') {
       return res.status(409).json({ error: 'Payment is not required for this ride' });
     }
+    if (Number(ride.oshu_qr_discount_inr ?? 0) > 0) {
+      return res.status(409).json({
+        error:
+          'This ride uses the Oshu UPI QR offer. Pay with Oshu’s company QR in the app — Razorpay is not available for this bill.',
+      });
+    }
 
     const inr = Number(ride.final_payable_inr ?? ride.quoted_price_inr);
     if (!Number.isFinite(inr) || inr <= 0) {

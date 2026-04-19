@@ -84,6 +84,184 @@ function roundMoney(n) {
   return Math.round(n * 100) / 100;
 }
 
+/** 1% off when customer pays Oshu directly via company UPI QR (not Razorpay checkout). */
+const OSHU_QR_PAY_DISCOUNT_PCT = 1;
+
+/** ₹ per kg of cargo above the vehicle’s max weight capacity (booking-time). */
+const OVERWEIGHT_INR_PER_KG = 2;
+
+function grossPayableInrFromRide(row) {
+  const q = Number(row?.quoted_price_inr ?? 0);
+  const ot = Number(row?.overtime_charge_inr ?? 0);
+  const toll = Number(row?.toll_inr ?? 0);
+  return roundMoney(
+    q + (Number.isFinite(ot) ? ot : 0) + (Number.isFinite(toll) ? toll : 0),
+  );
+}
+
+/** Excess cargo kg above capacity and charge (capacity NaN → no charge). */
+function overweightKgAndCharge(cargoKg, capacityKg) {
+  if (cargoKg == null || Number.isNaN(cargoKg) || cargoKg <= 0) {
+    return { excessKg: 0, chargeInr: 0 };
+  }
+  if (!Number.isFinite(capacityKg) || capacityKg <= 0) {
+    return { excessKg: 0, chargeInr: 0 };
+  }
+  const excessKg = Math.max(0, roundMoney(cargoKg - capacityKg));
+  const chargeInr = roundMoney(excessKg * OVERWEIGHT_INR_PER_KG);
+  return { excessKg, chargeInr };
+}
+
+function escapeHtml(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function fmtInr(n) {
+  const v = Number(n ?? 0);
+  const x = Number.isFinite(v) ? v : 0;
+  return `₹${Math.round(x)}`;
+}
+
+function renderInvoiceHtml({ ride, customer, packaging }) {
+  const createdAt = ride?.created_at ? new Date(ride.created_at) : new Date();
+  const invoiceNo = `OSHU-${String(ride?.id ?? '').slice(0, 8).toUpperCase()}`;
+  const gstin = customer?.customer_gstin ? String(customer.customer_gstin).trim() : '';
+  const gstinPrint = gstin ? escapeHtml(gstin) : '----';
+
+  const delivery = Number(ride?.base_fare_inr ?? 0);
+  const packagingFee = Number(ride?.packaging_fee_inr ?? 0);
+  const manpowerFee = Number(ride?.manpower_fee_inr ?? 0);
+  const subtotalBefore = Number(ride?.subtotal_before_discount_inr ?? delivery + packagingFee + manpowerFee);
+  const discPct = Number(ride?.customer_discount_percent ?? 0);
+  const segDiscount = Math.round((subtotalBefore * Math.max(0, discPct)) / 100);
+  const coinDiscount = Math.round(Number(ride?.coin_discount_inr ?? 0));
+  const overtime = Math.round(Number(ride?.overtime_charge_inr ?? 0));
+  const qrDisc = Math.round(Number(ride?.oshu_qr_discount_inr ?? 0));
+  const toll = Math.round(Number(ride?.toll_inr ?? 0));
+  const overweightCh = Math.round(Number(ride?.overweight_charge_inr ?? 0));
+  const overweightKg = Number(ride?.cargo_overweight_kg ?? 0);
+  const capW = Number(ride?.vehicle_max_weight_capacity_kg ?? 0);
+  const rateOw = Number(ride?.overweight_rate_inr_per_kg ?? OVERWEIGHT_INR_PER_KG);
+  const cargoDeclared = Number(ride?.weight_kg ?? 0);
+  const total = Math.round(Number(ride?.final_payable_inr ?? ride?.quoted_price_inr ?? 0));
+
+  const owLabel =
+    overweightCh > 0
+      ? `Over-weight cargo — ${Math.round(overweightKg)} kg above ${Number.isFinite(capW) ? String(Math.round(capW)) : '—'} kg limit @ ₹${Math.round(rateOw)}/kg`
+      : '';
+
+  const items = [
+    { label: 'Trip / delivery charge', amt: delivery },
+    { label: `Packaging${packaging?.name ? ` (${packaging.name})` : ''}`, amt: packagingFee },
+    { label: 'Manpower / helper', amt: manpowerFee },
+    ...(overweightCh > 0 ? [{ label: owLabel, amt: overweightCh }] : []),
+    ...(segDiscount > 0 ? [{ label: `Welcome / business offer (${discPct}% on trip + packaging + helper)`, amt: -segDiscount }] : []),
+    ...(coinDiscount > 0 ? [{ label: 'Oshu Coins redeemed', amt: -coinDiscount }] : []),
+    ...(overtime > 0 ? [{ label: 'Service overtime (after included minutes)', amt: overtime }] : []),
+    ...(toll > 0 ? [{ label: 'Toll (pickup to drop, added at delivery)', amt: toll }] : []),
+    ...(qrDisc > 0 ? [{ label: `Oshu UPI QR offer (${OSHU_QR_PAY_DISCOUNT_PCT}%)`, amt: -qrDisc }] : []),
+  ].filter(x => Math.round(Number(x.amt ?? 0)) !== 0);
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Invoice • ${escapeHtml(invoiceNo)}</title>
+    <style>
+      :root { --p:#6D28D9; --bg:#F5F3FF; --text:#111827; --muted:#6B7280; --line:#E5E7EB; }
+      body { margin:0; font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial, sans-serif; background: #fff; color: var(--text); }
+      .wrap { padding: 20px; max-width: 760px; margin: 0 auto; }
+      .top { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }
+      .brand { font-weight: 900; font-size: 22px; letter-spacing: -0.3px; color: var(--p); }
+      .tag { display:inline-block; margin-top: 6px; padding: 6px 10px; border-radius: 999px; background: var(--bg); border: 1px solid #DDD6FE; font-weight: 800; font-size: 12px; color: #4C1D95; }
+      .meta { text-align:right; font-size: 12px; color: var(--muted); line-height: 1.5; }
+      .card { margin-top: 14px; border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+      .sec { padding: 14px 14px; border-top: 1px solid var(--line); }
+      .sec:first-child { border-top: none; }
+      .row { display:flex; justify-content:space-between; gap: 12px; }
+      .k { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.7px; font-weight: 900; }
+      .v { font-size: 13px; color: var(--text); font-weight: 800; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+      th { text-align:left; color: var(--muted); font-size: 11px; letter-spacing: 0.7px; text-transform: uppercase; }
+      td:last-child, th:last-child { text-align:right; }
+      .total { font-size: 16px; font-weight: 900; }
+      .note { margin-top: 10px; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="top">
+        <div>
+          <div class="brand">Oshu</div>
+          <div class="tag">Invoice / Bill</div>
+        </div>
+        <div class="meta">
+          <div><strong>${escapeHtml(invoiceNo)}</strong></div>
+          <div>${escapeHtml(createdAt.toLocaleDateString())}</div>
+          <div>Ride ID: ${escapeHtml(ride?.id ?? '')}</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="sec">
+          <div class="row">
+            <div>
+              <div class="k">Customer</div>
+              <div class="v">${escapeHtml(customer?.full_name ?? 'Customer')}</div>
+              <div class="note">${escapeHtml(customer?.phone ?? '')}</div>
+            </div>
+            <div style="text-align:right">
+              <div class="k">GSTIN</div>
+              <div class="v">${gstinPrint}</div>
+            </div>
+          </div>
+        </div>
+        <div class="sec">
+          <div class="k">Route</div>
+          <div class="note"><strong>Pickup:</strong> ${escapeHtml(ride?.pickup_address ?? '—')}</div>
+          <div class="note"><strong>Drop:</strong> ${escapeHtml(ride?.drop_address ?? '—')}</div>
+          ${
+            Number.isFinite(cargoDeclared) && cargoDeclared > 0
+              ? `<div class="note"><strong>Declared cargo weight:</strong> ${escapeHtml(String(Math.round(cargoDeclared)))} kg</div>`
+              : ''
+          }
+        </div>
+        <div class="sec">
+          <table>
+            <thead>
+              <tr><th>Description</th><th>Amount</th></tr>
+            </thead>
+            <tbody>
+              ${items
+                .map(
+                  it =>
+                    `<tr><td>${escapeHtml(it.label)}</td><td>${escapeHtml(fmtInr(it.amt))}</td></tr>`,
+                )
+                .join('')}
+              <tr><td class="total">Total payable</td><td class="total">${escapeHtml(fmtInr(total))}</td></tr>
+            </tbody>
+          </table>
+          <div class="note">
+            Each line above is part of your fare. Overtime applies after included free service minutes. Toll is
+            recorded when the partner completes the job. Over-weight applies when declared weight exceeds the
+            vehicle’s rated capacity (${escapeHtml(String(Math.round(rateOw)))} ₹/kg on the excess).
+          </div>
+        </div>
+      </div>
+
+      <div class="note">This invoice is generated by Oshu for your delivery charges and add-ons.</div>
+    </div>
+  </body>
+</html>`;
+}
+
 function quoteFromRow(distanceKm, row) {
   const perKm = Number(row.price_per_km_inr);
   const minFare = Number(row.min_fare_inr ?? 0);
@@ -750,19 +928,18 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     if (error) {
       return res.status(500).json({ error: error.message });
     }
-    const eligible =
-      filterWeightKg != null
-        ? (rows ?? []).filter(r => {
-            const cap = maxCargoKgForPricingRow(r);
-            return Number.isFinite(cap) && cap >= filterWeightKg;
-          })
-        : (rows ?? []);
+    const eligible = rows ?? [];
     const options = eligible.map(row => {
       const base_fare_inr = quoteFromRow(distance_km, row);
       const subtotal = totalFromParts(base_fare_inr, packaging_fee_inr, manpower_fee_inr);
       const discount_inr = roundMoney(subtotal * (discountPct / 100));
-      const estimated_price_inr = roundMoney(Math.max(0, subtotal - discount_inr));
+      const afterDisc = roundMoney(Math.max(0, subtotal - discount_inr));
       const capKg = maxCargoKgForPricingRow(row);
+      const { excessKg, chargeInr } = overweightKgAndCharge(
+        filterWeightKg != null ? filterWeightKg : NaN,
+        Number.isFinite(capKg) ? capKg : NaN,
+      );
+      const estimated_price_inr = roundMoney(afterDisc + chargeInr);
       return {
         vehicle_type: row.vehicle_type,
         price_per_km_inr: Number(row.price_per_km_inr),
@@ -774,6 +951,13 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         estimated_subtotal_inr: subtotal,
         customer_discount_percent: discountPct,
         discount_inr,
+        ...(filterWeightKg != null && excessKg > 0
+          ? {
+              cargo_overweight_kg: excessKg,
+              overweight_charge_inr: chargeInr,
+              overweight_rate_inr_per_kg: OVERWEIGHT_INR_PER_KG,
+            }
+          : {}),
         estimated_price_inr,
       };
     });
@@ -785,6 +969,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       ride_included_service_minutes: svcDefaults.includedMin,
       ride_overtime_inr_per_min: svcDefaults.overtimePerMin,
       cargo_weight_kg: filterWeightKg,
+      overweight_rate_inr_per_kg: OVERWEIGHT_INR_PER_KG,
       customer_discount_percent: discountPct,
       customer_discount_label:
         discountPct > 0
@@ -885,17 +1070,10 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(400).json({ error: 'Unknown vehicle type for this region' });
     }
     const typeMaxKg = maxCargoKgForPricingRow(priceRow);
-    if (
-      weight_kg != null &&
-      !Number.isNaN(weight_kg) &&
-      weight_kg > 0 &&
-      Number.isFinite(typeMaxKg) &&
-      weight_kg > typeMaxKg
-    ) {
-      return res.status(400).json({
-        error: 'This vehicle class cannot carry your cargo weight. Choose a vehicle with higher capacity.',
-      });
-    }
+    const { excessKg: cargoOverweightKg, chargeInr: overweightChargeInr } = overweightKgAndCharge(
+      weight_kg != null && !Number.isNaN(weight_kg) && weight_kg > 0 ? weight_kg : NaN,
+      Number.isFinite(typeMaxKg) ? typeMaxKg : NaN,
+    );
     const base_fare_inr = quoteFromRow(distance_km, priceRow);
     const subtotal_before_discount_inr = totalFromParts(base_fare_inr, packaging_fee_inr, manpower_fee_inr);
     const discount_inr = roundMoney(subtotal_before_discount_inr * (discountPct / 100));
@@ -913,7 +1091,9 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       coinsApplied = Math.min(coins_to_redeem, balance, maxByPct);
       coinDiscountInr = coinsApplied;
     }
-    const quoted_price_inr = roundMoney(Math.max(0, subtotal_after_segment_discount - coinDiscountInr));
+    const quoted_price_inr = roundMoney(
+      Math.max(0, subtotal_after_segment_discount - coinDiscountInr) + overweightChargeInr,
+    );
 
     const svcDefaults = await loadRideServiceDefaults(supabase);
     const handshake_pin = genHandshakePin();
@@ -945,6 +1125,11 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         customer_discount_percent: discountPct,
         coins_redeemed: coinsApplied,
         coin_discount_inr: coinDiscountInr,
+        vehicle_max_weight_capacity_kg: Number.isFinite(typeMaxKg) ? typeMaxKg : null,
+        cargo_overweight_kg: cargoOverweightKg,
+        overweight_rate_inr_per_kg: OVERWEIGHT_INR_PER_KG,
+        overweight_charge_inr: overweightChargeInr,
+        toll_inr: 0,
         quoted_price_inr,
         handshake_pin,
         included_service_minutes: svcDefaults.includedMin,
@@ -1232,7 +1417,12 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       overtimeMin = Math.max(0, durationMin - included);
       overtimeCharge = roundMoney(overtimeMin * rate);
     }
-    const finalPayable = roundMoney(baseFare + overtimeCharge);
+    const tollRaw = req.body?.toll_inr;
+    const tollParsed =
+      tollRaw != null && tollRaw !== '' ? Number(tollRaw) : 0;
+    const tollInr =
+      Number.isFinite(tollParsed) && tollParsed > 0 ? roundMoney(Math.min(tollParsed, 500000)) : 0;
+    const finalPayable = roundMoney(baseFare + overtimeCharge + tollInr);
     const at = end.toISOString();
     const { data, error } = await supabase
       .from('ride_requests')
@@ -1242,6 +1432,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         updated_at: at,
         overtime_minutes: overtimeMin,
         overtime_charge_inr: overtimeCharge,
+        toll_inr: tollInr,
         final_payable_inr: finalPayable,
         payment_status: 'awaiting_payment',
       })
@@ -1287,6 +1478,11 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     if (row.status !== 'completed') {
       return res.status(409).json({ error: 'Ride is not completed' });
     }
+    if (Number(row.oshu_qr_discount_inr ?? 0) > 0) {
+      return res.status(409).json({
+        error: 'This ride uses the Oshu QR discount. Confirm UPI to Oshu instead of cash (COD).',
+      });
+    }
 
     const { data: rpcRaw, error: rpcErr } = await supabase.rpc('apply_captain_cod_ride_record', {
       p_ride_id: id,
@@ -1310,6 +1506,125 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       emitRide(io, rideOut);
     }
     return res.json({ ok: true, cod_amount_inr: result.cod_amount_inr });
+  });
+
+  /**
+   * Customer: apply or remove the 1% Oshu company UPI QR discount on the completed bill.
+   * While applied, Razorpay checkout is disabled; customer pays Oshu’s QR and captain confirms.
+   */
+  app.post('/api/rides/:id/oshu-qr-discount', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const profile = await getProfile(supabase, uid);
+    if (!profile || profile.role !== 'user') {
+      return res.status(403).json({ error: 'Customers only' });
+    }
+    const id = req.params.id;
+    const apply = Boolean(req.body?.apply);
+    const { data: row, error: rowErr } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (rowErr) {
+      return res.status(500).json({ error: rowErr.message });
+    }
+    if (!row || row.customer_id !== uid) {
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (row.status !== 'completed') {
+      return res.status(409).json({ error: 'Ride is not completed' });
+    }
+    if (row.payment_status !== 'awaiting_payment') {
+      return res.status(409).json({ error: 'Payment is not pending for this ride' });
+    }
+    const gross = grossPayableInrFromRide(row);
+    if (!Number.isFinite(gross) || gross <= 0) {
+      return res.status(400).json({ error: 'Invalid payable amount' });
+    }
+    const discount = apply ? roundMoney((gross * OSHU_QR_PAY_DISCOUNT_PCT) / 100) : 0;
+    const finalPayable = apply ? roundMoney(Math.max(0, gross - discount)) : gross;
+    const at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('ride_requests')
+      .update({
+        oshu_qr_discount_inr: discount,
+        final_payable_inr: finalPayable,
+        razorpay_order_id: null,
+        updated_at: at,
+      })
+      .eq('id', id)
+      .eq('customer_id', uid)
+      .eq('status', 'completed')
+      .eq('payment_status', 'awaiting_payment')
+      .select('*')
+      .maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    if (!data) {
+      return res.status(409).json({ error: 'Could not update payment options' });
+    }
+    emitRide(io, data);
+    return res.json({ ride: data });
+  });
+
+  /** Captain: customer paid Oshu’s company UPI / QR (1% discount path; no Razorpay, no COD ledger). */
+  app.post('/api/rides/:id/confirm-oshu-qr', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const profile = await getProfile(supabase, uid);
+    if (!profile || profile.role !== 'captain') {
+      return res.status(403).json({ error: 'Captains only' });
+    }
+    const id = req.params.id;
+    const { data: row, error: rowErr } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (rowErr) {
+      return res.status(500).json({ error: rowErr.message });
+    }
+    if (!row || row.captain_id !== uid) {
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (row.status !== 'completed') {
+      return res.status(409).json({ error: 'Ride is not completed' });
+    }
+    if (row.payment_status !== 'awaiting_payment') {
+      return res.json({ ok: true, duplicate: true });
+    }
+    if (Number(row.oshu_qr_discount_inr ?? 0) <= 0) {
+      return res.status(400).json({
+        error: 'Oshu QR discount is not active on this ride. Customer should pay online or confirm COD.',
+      });
+    }
+    const at = new Date().toISOString();
+    const { data: updated, error } = await supabase
+      .from('ride_requests')
+      .update({
+        payment_status: 'paid_oshu_qr',
+        updated_at: at,
+      })
+      .eq('id', id)
+      .eq('captain_id', uid)
+      .eq('status', 'completed')
+      .eq('payment_status', 'awaiting_payment')
+      .select('*')
+      .maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    if (!updated) {
+      return res.json({ ok: true, duplicate: true });
+    }
+    emitRide(io, updated);
+    return res.json({ ok: true });
   });
 
   /** Captain: past completed jobs. */
@@ -1446,6 +1761,61 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       delete out.handshake_pin;
     }
     return res.json({ ride: out });
+  });
+
+  /** Invoice / bill for a ride (HTML for printing; JSON optional). */
+  app.get('/api/rides/:id/invoice', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const requester = await getProfile(supabase, uid);
+    if (!requester) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    const id = req.params.id;
+    const { data: ride, error } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    if (!ride) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    const ok =
+      requester.role === 'admin' || ride.customer_id === uid || ride.captain_id === uid;
+    if (!ok) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    const { data: customer } = await supabase
+      .from('profiles')
+      .select('full_name, phone, customer_gstin')
+      .eq('id', ride.customer_id)
+      .maybeSingle();
+    const { data: packaging } =
+      ride.packaging_type_id
+        ? await supabase
+            .from('packaging_types')
+            .select('id, name, slug')
+            .eq('id', ride.packaging_type_id)
+            .maybeSingle()
+        : { data: null };
+
+    const format = String(req.query.format ?? 'html').toLowerCase();
+    if (format === 'json') {
+      return res.json({
+        ride,
+        customer: customer ?? null,
+        packaging: packaging ?? null,
+      });
+    }
+    const html = renderInvoiceHtml({ ride, customer, packaging });
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(html);
   });
 
   /** Customer: cancel pending ride. */

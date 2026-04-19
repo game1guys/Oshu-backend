@@ -266,8 +266,9 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       .select(
         `id, status, vehicle_type, pickup_address, drop_address,
          distance_km, base_fare_inr, quoted_price_inr, coin_discount_inr,
+         overtime_charge_inr, toll_inr, overweight_charge_inr, cargo_overweight_kg, final_payable_inr,
          coins_earned, coins_redeemed, created_at,
-         customer_id, driver_id`,
+         customer_id, captain_id`,
         { count: 'exact' },
       )
       .order('created_at', { ascending: false })
@@ -290,7 +291,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
     const ids = new Set();
     for (const r of ridesRaw) {
       if (r.customer_id) ids.add(r.customer_id);
-      if (r.driver_id) ids.add(r.driver_id);
+      if (r.captain_id) ids.add(r.captain_id);
     }
     let peopleById = {};
     if (ids.size) {
@@ -305,7 +306,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
     const rides = ridesRaw.map(r => ({
       ...r,
       customer: r.customer_id ? peopleById[r.customer_id] ?? null : null,
-      captain: r.driver_id ? peopleById[r.driver_id] ?? null : null,
+      captain: r.captain_id ? peopleById[r.captain_id] ?? null : null,
     }));
     return res.json({ rides, total: count ?? 0, page, limit });
   });
@@ -322,8 +323,8 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
     if (error) return res.status(500).json({ error: error.message });
     if (!data)  return res.status(404).json({ error: 'Ride not found' });
     const customerId = data.customer_id;
-    const driverId = data.driver_id;
-    const ids = [customerId, driverId].filter(Boolean);
+    const captainId = data.captain_id;
+    const ids = [customerId, captainId].filter(Boolean);
     let peopleById = {};
     if (ids.length) {
       const { data: people } = await supabase.from('profiles').select('*').in('id', ids);
@@ -335,7 +336,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       ride: {
         ...data,
         customer: customerId ? peopleById[customerId] ?? null : null,
-        captain: driverId ? peopleById[driverId] ?? null : null,
+        captain: captainId ? peopleById[captainId] ?? null : null,
       },
     });
   });
@@ -358,12 +359,12 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
     if (!ride) return res.status(404).json({ error: 'Ride not found' });
 
     let location = null;
-    const driverId = ride.driver_id;
-    if (driverId) {
+    const captainId = ride.captain_id;
+    if (captainId) {
       const { data: trip } = await supabase
         .from('trips')
         .select('id, current_lat, current_lng, last_location_at, status')
-        .eq('driver_id', driverId)
+        .eq('driver_id', captainId)
         .in('status', ['assigned', 'in_progress'])
         .order('updated_at', { ascending: false })
         .limit(1)
@@ -380,7 +381,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
     }
 
     const customerId = ride.customer_id;
-    const ids = [customerId, driverId].filter(Boolean);
+    const ids = [customerId, captainId].filter(Boolean);
     let peopleById = {};
     if (ids.length) {
       const { data: people } = await supabase.from('profiles').select('*').in('id', ids);
@@ -392,7 +393,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       ride: {
         ...ride,
         customer: customerId ? peopleById[customerId] ?? null : null,
-        captain: driverId ? peopleById[driverId] ?? null : null,
+        captain: captainId ? peopleById[captainId] ?? null : null,
       },
       location,
     });
@@ -449,7 +450,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
 
     const { data, error } = await supabase
       .from('ride_requests')
-      .select('driver_id, quoted_price_inr, created_at')
+      .select('captain_id, quoted_price_inr, created_at')
       .eq('status', 'completed')
       .gte('created_at', since.toISOString());
     if (error) return res.status(500).json({ error: error.message });
@@ -457,7 +458,7 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
     const rows = data ?? [];
     const map = new Map();
     for (const r of rows) {
-      const id = r.driver_id;
+      const id = r.captain_id;
       if (!id) continue;
       const cur = map.get(id) ?? { captain_id: id, rides: 0, total_inr: 0 };
       cur.rides += 1;
@@ -663,8 +664,8 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       supabase.from('profiles').select('*').eq('id', req.params.id).maybeSingle(),
       supabase
         .from('ride_requests')
-        .select('id, status, quoted_price_inr, created_at, customer_id, driver_id, pickup_address, drop_address')
-        .or(`customer_id.eq.${req.params.id},driver_id.eq.${req.params.id}`)
+        .select('id, status, quoted_price_inr, created_at, customer_id, captain_id, pickup_address, drop_address')
+        .or(`customer_id.eq.${req.params.id},captain_id.eq.${req.params.id}`)
         .order('created_at', { ascending: false })
         .limit(20),
       supabase.from('vehicles').select('*').eq('driver_id', req.params.id).maybeSingle(),

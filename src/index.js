@@ -14,6 +14,7 @@ import { registerAddressRoutes } from './addressRoutes.js';
 import { registerReferralRoutes } from './referralRoutes.js';
 import { registerPaymentRoutes, registerRazorpayWebhook } from './paymentRoutes.js';
 import { registerCaptainWalletRoutes } from './captainWalletRoutes.js';
+import { registerAuthBootstrapRoutes } from './authBootstrapRoutes.js';
 import { attachTripSocket } from './tripSocket.js';
 
 const app = express();
@@ -94,24 +95,26 @@ registerAddressRoutes(app, { supabase, getUserIdFromAccessToken });
 registerReferralRoutes(app, { supabase, getUserIdFromAccessToken });
 registerPaymentRoutes(app, { supabase, getUserIdFromAccessToken });
 registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccessToken });
+registerAuthBootstrapRoutes(app, { supabase, getUserIdFromAccessToken });
 
-app.get('/health', (_req, res) => {
-  res.json({
+/** Whether dev OTP bypass is on — helps verify the running process picked up `.env` after deploy/restart. */
+function healthPayload() {
+  return {
     ok: true,
     service: 'oshu-backend',
     uptime_s: Math.round(process.uptime()),
     now: new Date().toISOString(),
-  });
+    dev_otp_bypass_enabled: process.env.ALLOW_DEV_OTP_BYPASS === 'true',
+  };
+}
+
+app.get('/health', (_req, res) => {
+  res.json(healthPayload());
 });
 
 // Alias (some reverse proxies only forward /api/*).
 app.get('/api/health', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'oshu-backend',
-    uptime_s: Math.round(process.uptime()),
-    now: new Date().toISOString(),
-  });
+  res.json(healthPayload());
 });
 
 app.get('/db/health', async (_req, res) => {
