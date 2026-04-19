@@ -1,6 +1,47 @@
 /**
  * Socket.IO: real-time captain location per trip. Rooms: trip:{tripId}, driver:{userId}
+ * Ephemeral ride chat: ride_chat:{rideRequestId} — not stored in DB; 10 msgs per customer + 10 per captain.
  */
+
+const RIDE_CHAT_MAX_CUSTOMER = 10;
+const RIDE_CHAT_MAX_CAPTAIN = 10;
+const RIDE_CHAT_MAX_LEN = 800;
+
+/** @type {Map<string, { customer: number; captain: number }>} */
+const rideChatCounts = new Map();
+
+function rideChatKey(rideId) {
+  return String(rideId ?? '');
+}
+
+function getRideChatCounts(rideId) {
+  const k = rideChatKey(rideId);
+  if (!rideChatCounts.has(k)) {
+    rideChatCounts.set(k, { customer: 0, captain: 0 });
+  }
+  return rideChatCounts.get(k);
+}
+
+async function assertRideChatParticipant(supabase, rideId, userId) {
+  const { data: ride, error } = await supabase
+    .from('ride_requests')
+    .select('id, status, customer_id, captain_id')
+    .eq('id', rideId)
+    .maybeSingle();
+  if (error || !ride) {
+    return { ok: false, error: 'ride not found' };
+  }
+  if (!['accepted', 'in_progress'].includes(ride.status)) {
+    return { ok: false, error: 'chat only after captain accepts' };
+  }
+  if (ride.customer_id === userId) {
+    return { ok: true, role: 'customer' };
+  }
+  if (ride.captain_id === userId) {
+    return { ok: true, role: 'captain' };
+  }
+  return { ok: false, error: 'forbidden' };
+}
 
 export function attachTripSocket(io, { supabase, getUserIdFromAccessToken }) {
   io.use(async (socket, next) => {
@@ -52,6 +93,131 @@ export function attachTripSocket(io, { supabase, getUserIdFromAccessToken }) {
       socket.join(`trip:${tripId}`);
       if (typeof cb === 'function') {
         cb({ ok: true });
+      }
+    });
+
+    socket.on('join_ride_chat', async (payload, cb) => {
+      const rideId = payload?.rideId;
+      if (!rideId || typeof rideId !== 'string') {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: 'rideId required' });
+        }
+        return;
+      }
+      if (!supabase) {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: 'server unavailable' });
+        }
+        return;
+      }
+      const gate = await assertRideChatParticipant(supabase, rideId, userId);
+      if (!gate.ok) {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: gate.error });
+        }
+        return;
+      }
+      const c = getRideChatCounts(rideId);
+      socket.join(`ride_chat:${rideId}`);
+      if (typeof cb === 'function') {
+        cb({
+          ok: true,
+          customerSent: c.customer,
+          captainSent: c.captain,
+          customerMax: RIDE_CHAT_MAX_CUSTOMER,
+          captainMax: RIDE_CHAT_MAX_CAPTAIN,
+        });
+      }
+    });
+
+    socket.on('leave_ride_chat', payload => {
+      const rideId = payload?.rideId;
+      if (rideId && typeof rideId === 'string') {
+        socket.leave(`ride_chat:${rideId}`);
+      }
+    });
+
+    socket.on('ride_chat_send', async (payload, cb) => {
+      const rideId = payload?.rideId;
+      const textRaw = payload?.text;
+      if (!rideId || typeof rideId !== 'string') {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: 'rideId required' });
+        }
+        return;
+      }
+      if (!supabase) {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: 'server unavailable' });
+        }
+        return;
+      }
+      const gate = await assertRideChatParticipant(supabase, rideId, userId);
+      if (!gate.ok) {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: gate.error });
+        }
+        return;
+      }
+      const text = String(textRaw ?? '')
+        .trim()
+        .replace(/\s+/g, ' ');
+      if (!text) {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: 'empty message' });
+        }
+        return;
+      }
+      if (text.length > RIDE_CHAT_MAX_LEN) {
+        if (typeof cb === 'function') {
+          cb({ ok: false, error: 'message too long' });
+        }
+        return;
+      }
+      const counts = getRideChatCounts(rideId);
+      const side = gate.role;
+      if (side === 'customer' && counts.customer >= RIDE_CHAT_MAX_CUSTOMER) {
+        if (typeof cb === 'function') {
+          cb({
+            ok: false,
+            error: 'customer limit',
+            customerSent: counts.customer,
+            captainSent: counts.captain,
+          });
+        }
+        return;
+      }
+      if (side === 'captain' && counts.captain >= RIDE_CHAT_MAX_CAPTAIN) {
+        if (typeof cb === 'function') {
+          cb({
+            ok: false,
+            error: 'captain limit',
+            customerSent: counts.customer,
+            captainSent: counts.captain,
+          });
+        }
+        return;
+      }
+      if (side === 'customer') {
+        counts.customer += 1;
+      } else {
+        counts.captain += 1;
+      }
+      const sentAt = new Date().toISOString();
+      io.to(`ride_chat:${rideId}`).emit('ride_chat_message', {
+        rideId,
+        from: side,
+        text,
+        sentAt,
+        customerSent: counts.customer,
+        captainSent: counts.captain,
+      });
+      if (typeof cb === 'function') {
+        cb({
+          ok: true,
+          customerSent: counts.customer,
+          captainSent: counts.captain,
+        });
       }
     });
 
