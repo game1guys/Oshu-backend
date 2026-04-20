@@ -3,6 +3,12 @@
  */
 
 import { haversineKm } from './geo.js';
+import {
+  captainNetFromCustomerPayment,
+  isPlausibleUpiVpa,
+  normalizeUpiVpa,
+  platformFeePct,
+} from './walletUtils.js';
 import { fetchDrivingRoutePolyline } from './googleDrivingRoutePolyline.js';
 import { fetchRouteTollEstimateInr } from './googleRouteTollEstimate.js';
 import { awardCoinsForRide } from './coinRoutes.js';
@@ -84,6 +90,42 @@ function customerDiscountPercentFromProfile(profile) {
 
 function roundMoney(n) {
   return Math.round(n * 100) / 100;
+}
+
+/** Oshu’s share of `final_payable_inr` (platform %). */
+function captainPlatformFeeInrFromFinal(finalPayableInr) {
+  const gross = Number(finalPayableInr);
+  if (!Number.isFinite(gross) || gross <= 0) {
+    return 0;
+  }
+  const net = captainNetFromCustomerPayment(gross);
+  return roundMoney(Math.max(0, gross - net));
+}
+
+const CAPTAIN_PLATFORM_DUE_CAP_INR = Math.max(
+  0,
+  Number(process.env.OSHU_CAPTAIN_PLATFORM_DUE_CAP_INR ?? 1000) || 1000,
+);
+
+/** Deep link for customer to pay Oshu company UPI (shown on captain device after complete). */
+function buildOshuCompanyUpiPayUri(vpaRaw, amountInr, rideId) {
+  const pa = normalizeUpiVpa(vpaRaw);
+  if (!isPlausibleUpiVpa(pa)) {
+    return null;
+  }
+  const am = roundMoney(Number(amountInr));
+  if (!Number.isFinite(am) || am <= 0) {
+    return null;
+  }
+  const tn = `Oshu ride ${String(rideId).slice(0, 8)}`;
+  const q = new URLSearchParams({
+    pa,
+    pn: 'Oshu',
+    am: String(am),
+    cu: 'INR',
+    tn,
+  });
+  return `upi://pay?${q.toString()}`;
 }
 
 /** 1% off when customer pays Oshu directly via company UPI QR (not Razorpay checkout). */
@@ -1327,6 +1369,27 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(403).json({ error: 'Captains only' });
     }
     const id = req.params.id;
+    const [{ data: dueRow, error: dueErr }, { data: pendingRide, error: pendErr }] = await Promise.all([
+      supabase.from('profiles').select('captain_oshu_platform_due_inr').eq('id', uid).maybeSingle(),
+      supabase.from('ride_requests').select('quoted_price_inr').eq('id', id).eq('status', 'pending').maybeSingle(),
+    ]);
+    if (dueErr || pendErr) {
+      return res.status(500).json({ error: dueErr?.message ?? pendErr?.message ?? 'Lookup failed' });
+    }
+    if (!pendingRide) {
+      return res.status(409).json({ error: 'Already taken or not found' });
+    }
+    const due = Number(dueRow?.captain_oshu_platform_due_inr ?? 0);
+    const quoted = Number(pendingRide.quoted_price_inr ?? 0);
+    const estFee = roundMoney((Number.isFinite(quoted) ? quoted : 0) * (platformFeePct() / 100));
+    if (due + estFee > CAPTAIN_PLATFORM_DUE_CAP_INR) {
+      return res.status(403).json({
+        error:
+          'Oshu platform fee pending is too high (over ₹' +
+          String(CAPTAIN_PLATFORM_DUE_CAP_INR) +
+          '). Pay Oshu via company UPI from Wallet first, then accept new rides.',
+      });
+    }
     const at = new Date().toISOString();
     const { data, error } = await supabase
       .from('ride_requests')
@@ -1468,6 +1531,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     /** `quoted_price_inr` already includes route toll from booking; only overtime is added here. */
     const finalPayable = roundMoney(baseFare + overtimeCharge);
+    const captainPlatformFeeInr = captainPlatformFeeInrFromFinal(finalPayable);
     const at = end.toISOString();
     const { data, error } = await supabase
       .from('ride_requests')
@@ -1478,6 +1542,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         overtime_minutes: overtimeMin,
         overtime_charge_inr: overtimeCharge,
         final_payable_inr: finalPayable,
+        captain_platform_fee_inr: captainPlatformFeeInr,
         payment_status: 'awaiting_payment',
       })
       .eq('id', id)
@@ -1492,7 +1557,58 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(409).json({ error: 'Cannot complete' });
     }
     emitRide(io, data);
-    return res.json({ ride: data });
+    const companyVpa = normalizeUpiVpa(process.env.OSHU_COMPANY_UPI_VPA);
+    const oshu_company_upi_pay_uri = buildOshuCompanyUpiPayUri(companyVpa, finalPayable, data.id);
+    return res.json({
+      ride: data,
+      oshu_company_upi_pay_uri,
+      captain_platform_fee_inr: captainPlatformFeeInr,
+    });
+  });
+
+  /**
+   * Captain: collected fare on own UPI/cash — accrues Oshu platform share to pending due (wallet ledger).
+   */
+  app.post('/api/rides/:id/captain-mark-own-collection', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const profile = await getProfile(supabase, uid);
+    if (!profile || profile.role !== 'captain') {
+      return res.status(403).json({ error: 'Captains only' });
+    }
+    const id = req.params.id;
+    const { data: row, error: rowErr } = await supabase.from('ride_requests').select('captain_id').eq('id', id).maybeSingle();
+    if (rowErr) {
+      return res.status(500).json({ error: rowErr.message });
+    }
+    if (!row || row.captain_id !== uid) {
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    const { data: rpcRaw, error: rpcErr } = await supabase.rpc('apply_captain_own_collection_platform_due', {
+      p_ride_id: id,
+    });
+    if (rpcErr) {
+      return res.status(500).json({ error: rpcErr.message });
+    }
+    const result = rpcRaw && typeof rpcRaw === 'object' ? rpcRaw : {};
+    if (result.ok !== true) {
+      const err = result.error;
+      if (err === 'ride_not_completed' || err === 'no_captain' || err === 'payment_not_pending') {
+        return res.status(409).json({ error: err });
+      }
+      return res.status(400).json({ error: err ?? 'Could not record' });
+    }
+    const { data: rideOut } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (rideOut) {
+      emitRide(io, rideOut);
+    }
+    return res.json({ ok: true, fee_inr: result.fee_inr ?? 0, duplicate: Boolean(result.duplicate) });
   });
 
   /**
@@ -1615,7 +1731,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     return res.json({ ride: data });
   });
 
-  /** Captain: customer paid Oshu’s company UPI / QR (1% discount path; no Razorpay, no COD ledger). */
+  /** Captain: customer paid Oshu’s company UPI / QR (with or without 1% discount; no Razorpay, no COD ledger). */
   app.post('/api/rides/:id/confirm-oshu-qr', async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     if (!token || !supabase) {
@@ -1642,11 +1758,6 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     if (row.payment_status !== 'awaiting_payment') {
       return res.json({ ok: true, duplicate: true });
-    }
-    if (Number(row.oshu_qr_discount_inr ?? 0) <= 0) {
-      return res.status(400).json({
-        error: 'Oshu QR discount is not active on this ride. Customer should pay online or confirm COD.',
-      });
     }
     const at = new Date().toISOString();
     const { data: updated, error } = await supabase

@@ -105,7 +105,7 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
     const { data: p, error } = await supabase
       .from('profiles')
       .select(
-        'id, role, captain_wallet_balance_inr, captain_wallet_withdrawn_total_inr, captain_cod_total_inr, captain_online_credited_total_inr, captain_wallet_upi_id',
+        'id, role, captain_wallet_balance_inr, captain_wallet_withdrawn_total_inr, captain_cod_total_inr, captain_online_credited_total_inr, captain_wallet_upi_id, captain_oshu_platform_due_inr',
       )
       .eq('id', uid)
       .maybeSingle();
@@ -120,6 +120,7 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
     const withdrawn = Number(p.captain_wallet_withdrawn_total_inr ?? 0);
     const cod = Number(p.captain_cod_total_inr ?? 0);
     const onlineCredited = Number(p.captain_online_credited_total_inr ?? 0);
+    const oshuPlatformDue = Number(p.captain_oshu_platform_due_inr ?? 0);
     /** Cash / UPI the captain kept directly (COD + withdrawn). */
     const inOwnHands = cod + withdrawn;
 
@@ -133,6 +134,8 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
       lifetime_online_credited_inr: onlineCredited,
       lifetime_withdrawn_inr: withdrawn,
       lifetime_cod_inr: cod,
+      /** INR platform share owed to Oshu (own-UPI collection path). */
+      oshu_platform_due_inr: oshuPlatformDue,
       /** Porter-style: money not held by Oshu (cash in pocket + already sent to self). */
       in_own_account_inr: inOwnHands,
       upi_saved: Boolean(savedVpa),
@@ -168,6 +171,40 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
       return res.status(500).json({ error: error.message });
     }
     return res.json({ entries: data ?? [], total: count ?? 0, page, limit });
+  });
+
+  /**
+   * Captain: record UPI payment to Oshu against pending platform due (honor-based; reduces captain_oshu_platform_due_inr).
+   */
+  app.post('/api/captain-wallet/oshu-due-payment', async (req, res) => {
+    const uid = await requireUser(supabase, getUserIdFromAccessToken, req, res);
+    if (!uid) {
+      return;
+    }
+    const { data: p } = await supabase.from('profiles').select('role').eq('id', uid).maybeSingle();
+    if (!p || p.role !== 'captain') {
+      return res.status(403).json({ error: 'Captains only' });
+    }
+    const amt = Number(req.body?.amount_inr);
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return res.status(400).json({ error: 'Invalid amount_inr' });
+    }
+    const { data: rpcRaw, error: rpcErr } = await supabase.rpc('apply_captain_oshu_due_payment', {
+      p_captain_id: uid,
+      p_amount_inr: amt,
+    });
+    if (rpcErr) {
+      return res.status(500).json({ error: rpcErr.message });
+    }
+    const result = rpcRaw && typeof rpcRaw === 'object' ? rpcRaw : {};
+    if (result.ok !== true) {
+      return res.status(400).json({ error: result.error ?? 'Could not apply payment' });
+    }
+    return res.json({
+      ok: true,
+      paid_inr: result.paid_inr ?? 0,
+      remaining_due_inr: result.remaining_due_inr ?? 0,
+    });
   });
 
   /** PATCH /api/captain-wallet/upi  body: { vpa } */
