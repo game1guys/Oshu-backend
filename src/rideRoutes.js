@@ -236,6 +236,8 @@ function renderInvoiceHtml({ ride, customer, packaging }) {
   const capW = Number(ride?.vehicle_max_weight_capacity_kg ?? 0);
   const rateOw = Number(ride?.overweight_rate_inr_per_kg ?? OVERWEIGHT_INR_PER_KG);
   const cargoDeclared = Number(ride?.weight_kg ?? 0);
+  const loadingCh = Math.round(Number(ride?.loading_charge_inr ?? 0));
+  const unloadingCh = Math.round(Number(ride?.unloading_charge_inr ?? 0));
   const total = Math.round(Number(ride?.final_payable_inr ?? ride?.quoted_price_inr ?? 0));
 
   const owLabel =
@@ -248,6 +250,8 @@ function renderInvoiceHtml({ ride, customer, packaging }) {
     { label: `Packaging${packaging?.name ? ` (${packaging.name})` : ''}`, amt: packagingFee },
     { label: 'Manpower / helper', amt: manpowerFee },
     ...(overweightCh > 0 ? [{ label: owLabel, amt: overweightCh }] : []),
+    ...(loadingCh > 0 ? [{ label: 'Loading at pickup', amt: loadingCh }] : []),
+    ...(unloadingCh > 0 ? [{ label: 'Unloading at drop', amt: unloadingCh }] : []),
     ...(segDiscount > 0 ? [{ label: `Welcome / business offer (${discPct}% on trip + packaging + helper)`, amt: -segDiscount }] : []),
     ...(coinDiscount > 0 ? [{ label: 'Oshu Coins redeemed', amt: -coinDiscount }] : []),
     ...(overtime > 0 ? [{ label: 'Service overtime (after included minutes)', amt: overtime }] : []),
@@ -1178,6 +1182,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const packaging_type_id =
       typeof b.packaging_type_id === 'string' && b.packaging_type_id.trim() ? b.packaging_type_id.trim() : null;
     const manpower_requested = Boolean(b.manpower_requested);
+    const loading_charge_inr = Math.max(0, Math.round(Number(b.loading_charge_inr ?? 0)));
+    const unloading_charge_inr = Math.max(0, Math.round(Number(b.unloading_charge_inr ?? 0)));
     const coins_to_redeem = Math.max(0, Math.floor(Number(b.coins_to_redeem ?? 0)));
     const ppmRaw = b.preferred_payment_method;
     const preferred_payment_method =
@@ -1267,7 +1273,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       ? await fetchRouteTollEstimateInr(mapsKeyCreate, { pickup_lat, pickup_lng, drop_lat, drop_lng })
       : { toll_inr: 0, road_distance_km: null, ok: false, had_route: false };
     const tollInrAtBooking = roundMoney(Number(tollPkgCreate.toll_inr ?? 0));
-    quoted_price_inr = roundMoney(quoted_price_inr + tollInrAtBooking);
+    quoted_price_inr = roundMoney(quoted_price_inr + tollInrAtBooking + loading_charge_inr + unloading_charge_inr);
 
     const svcDefaults = await loadRideServiceDefaults(supabase);
     const handshake_pin = genHandshakePin();
@@ -1303,6 +1309,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         cargo_overweight_kg: cargoOverweightKg,
         overweight_rate_inr_per_kg: OVERWEIGHT_INR_PER_KG,
         overweight_charge_inr: overweightChargeInr,
+        loading_charge_inr: loading_charge_inr > 0 ? loading_charge_inr : null,
+        unloading_charge_inr: unloading_charge_inr > 0 ? unloading_charge_inr : null,
         toll_inr: tollInrAtBooking,
         quoted_price_inr,
         preferred_payment_method,
