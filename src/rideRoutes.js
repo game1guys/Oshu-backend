@@ -156,13 +156,14 @@ const OVERWEIGHT_INR_PER_KG = 0.5;
 
 /** Extra capacity (kg) allowed above max capacity, per vehicle class. */
 const VEHICLE_ADDITIONAL_CAPACITY_KG = {
-  bike: 10,
+  bike: 10,        // m cycle/scooter
   scooter: 10,
   e_rickshaw: 30,
-  electric_3w: 50,
-  auto: 100,
+  electric_3w: 50, // electric three wheeler
+  auto: 100,       // three wheeler
   tata_ace: 100,
   pickup: 200,
+  // other heavy load vehicles approved by RC: no additional (not in map → 0)
 };
 
 function grossPayableInrFromRide(row) {
@@ -401,11 +402,11 @@ function totalFromParts(base, packagingFee, manpowerFee) {
  * Align with supabase migration 012_vehicle_pricing_max_weight_capacity_kg.sql.
  */
 const VEHICLE_PRICING_DEFAULT_MAX_KG = {
-  bike: 25,
-  scooter: 25,
-  auto: 500,
+  bike: 25,        // m cycle / scooter
+  scooter: 25,     // m cycle / scooter
   e_rickshaw: 300,
-  electric_3w: 500,
+  electric_3w: 500, // electric three wheeler
+  auto: 500,        // three wheeler
   tata_ace: 700,
   pickup: 1400,
   mini_truck: 1500,
