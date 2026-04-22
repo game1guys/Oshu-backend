@@ -1386,6 +1386,20 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const capLat = parseFloat(String(req.query.lat ?? ''));
     const capLng = parseFloat(String(req.query.lng ?? ''));
     const hasCap = !Number.isNaN(capLat) && !Number.isNaN(capLng);
+    // Hard guard: offline captains must not receive open requests.
+    // Require a recent "available" presence heartbeat before returning pending rides.
+    const presenceFreshBefore = new Date(Date.now() - 3 * 60 * 1000).toISOString();
+    const { data: myPresence } = await supabase
+      .from('captain_presence')
+      .select('is_available, updated_at')
+      .eq('driver_id', uid)
+      .maybeSingle();
+    const isPresenceFresh =
+      !!myPresence?.updated_at && new Date(myPresence.updated_at).getTime() >= new Date(presenceFreshBefore).getTime();
+    const isDispatchEligible = Boolean(myPresence?.is_available) && isPresenceFresh;
+    if (!isDispatchEligible) {
+      return res.json({ rides: [] });
+    }
     const { data: myVehicle } = await supabase.from('vehicles').select('type').eq('driver_id', uid).maybeSingle();
     if (!myVehicle?.type) {
       return res.status(400).json({ error: 'Register your vehicle before accepting jobs' });
