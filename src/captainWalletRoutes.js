@@ -2,7 +2,12 @@
  * Captain wallet: summary, UPI, Razorpay X payouts (when configured).
  */
 
-import { isPlausibleUpiVpa, minWithdrawInr, normalizeUpiVpa } from './walletUtils.js';
+import { isPlausibleUpiVpa, minWithdrawInr, normalizeUpiVpa, platformFeePct } from './walletUtils.js';
+
+const CAPTAIN_PLATFORM_DUE_CAP_INR = Math.max(
+  0,
+  Number(process.env.OSHU_CAPTAIN_PLATFORM_DUE_CAP_INR ?? 1000) || 1000,
+);
 
 async function razorpayPost(path, body) {
   const key_id = process.env.RAZORPAY_KEY_ID;
@@ -136,6 +141,9 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
       lifetime_cod_inr: cod,
       /** INR platform share owed to Oshu (own-UPI collection path). */
       oshu_platform_due_inr: oshuPlatformDue,
+      /** Max pending due before new rides are blocked (front-end shows a live meter). */
+      oshu_platform_due_cap_inr: CAPTAIN_PLATFORM_DUE_CAP_INR,
+      oshu_platform_fee_pct: platformFeePct(),
       /** Porter-style: money not held by Oshu (cash in pocket + already sent to self). */
       in_own_account_inr: inOwnHands,
       upi_saved: Boolean(savedVpa),

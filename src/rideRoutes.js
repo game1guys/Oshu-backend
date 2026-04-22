@@ -11,6 +11,12 @@ import {
 } from './walletUtils.js';
 import { fetchDrivingRoutePolyline } from './googleDrivingRoutePolyline.js';
 import { fetchRouteTollEstimateInr } from './googleRouteTollEstimate.js';
+import {
+  appendRideChatLine,
+  assertRideChatParticipant,
+  rideChatSnapshot,
+  RIDE_CHAT_LIMITS,
+} from './tripSocket.js';
 import { awardCoinsForRide } from './coinRoutes.js';
 import { createClient } from '@supabase/supabase-js';
 
@@ -90,6 +96,20 @@ function customerDiscountPercentFromProfile(profile) {
 
 function roundMoney(n) {
   return Math.round(n * 100) / 100;
+}
+
+/** "₹1,234" / "₹1,234.56" — used in user-facing error messages. */
+function formatInrAmount(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) {
+    return '0';
+  }
+  const rounded = Math.round(v * 100) / 100;
+  const hasPaise = Math.round(rounded * 100) % 100 !== 0;
+  return new Intl.NumberFormat('en-IN', {
+    minimumFractionDigits: hasPaise ? 2 : 0,
+    maximumFractionDigits: 2,
+  }).format(rounded);
 }
 
 /** Oshu’s share of `final_payable_inr` (platform %). */
@@ -1381,13 +1401,19 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const due = Number(dueRow?.captain_oshu_platform_due_inr ?? 0);
     const quoted = Number(pendingRide.quoted_price_inr ?? 0);
-    const estFee = roundMoney((Number.isFinite(quoted) ? quoted : 0) * (platformFeePct() / 100));
+    const feePct = platformFeePct();
+    const estFee = roundMoney((Number.isFinite(quoted) ? quoted : 0) * (feePct / 100));
     if (due + estFee > CAPTAIN_PLATFORM_DUE_CAP_INR) {
       return res.status(403).json({
         error:
-          'Oshu platform fee pending is too high (over ₹' +
-          String(CAPTAIN_PLATFORM_DUE_CAP_INR) +
-          '). Pay Oshu via company UPI from Wallet first, then accept new rides.',
+          `Oshu commission pending is ₹${formatInrAmount(due)} — taking this ride would push you past the ₹${formatInrAmount(
+            CAPTAIN_PLATFORM_DUE_CAP_INR,
+          )} limit. Open Wallet → “Record Oshu UPI payment” to clear some of the due before accepting new rides.`,
+        reason: 'platform_due_cap_exceeded',
+        pending_due_inr: roundMoney(due),
+        cap_inr: CAPTAIN_PLATFORM_DUE_CAP_INR,
+        est_fee_inr: estFee,
+        platform_fee_pct: feePct,
       });
     }
     const at = new Date().toISOString();
@@ -1882,8 +1908,9 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
   });
 
   /**
-   * Customer or captain: road polyline from current vehicle position to drop (in-progress trips only).
-   * Uses GOOGLE_MAPS_API_KEY (Routes API). Returns { path: [{latitude,longitude}], ok }.
+   * Customer or captain: road polyline from current vehicle position to pickup (accepted) or drop (in_progress).
+   * Query: ?olat=&olng=&to=pickup|drop  (default to=drop for legacy clients).
+   * Returns { path, duration_seconds, distance_meters, ok }.
    */
   app.get('/api/rides/:id/driving-route-to-drop', async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
@@ -1905,23 +1932,126 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     if (row.customer_id !== uid && row.captain_id !== uid) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (row.status !== 'in_progress') {
-      return res.status(400).json({ error: 'Road route is only available once the trip has started' });
+    if (!['accepted', 'in_progress'].includes(row.status)) {
+      return res.status(400).json({ error: 'Live route is only available while the trip is accepted or in progress' });
     }
     const olat = parseFloat(String(req.query.olat ?? ''));
     const olng = parseFloat(String(req.query.olng ?? ''));
     if (Number.isNaN(olat) || Number.isNaN(olng)) {
       return res.status(400).json({ error: 'olat and olng required' });
     }
-    if (row.drop_lat == null || row.drop_lng == null) {
-      return res.status(400).json({ error: 'Drop location missing' });
+    const toRaw = String(req.query.to ?? '').toLowerCase();
+    const target =
+      toRaw === 'pickup' ? 'pickup' : toRaw === 'drop' ? 'drop' : row.status === 'accepted' ? 'pickup' : 'drop';
+    const destLat = target === 'pickup' ? row.pickup_lat : row.drop_lat;
+    const destLng = target === 'pickup' ? row.pickup_lng : row.drop_lng;
+    if (destLat == null || destLng == null) {
+      return res.status(400).json({ error: `${target} location missing` });
     }
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
     if (!apiKey) {
       return res.status(503).json({ error: 'Routing not configured', path: [], ok: false });
     }
-    const { path, ok } = await fetchDrivingRoutePolyline(apiKey, olat, olng, row.drop_lat, row.drop_lng);
-    return res.json({ path: ok ? path : [], ok: Boolean(ok && path?.length) });
+    const { path, ok, duration_seconds, distance_meters } = await fetchDrivingRoutePolyline(
+      apiKey,
+      olat,
+      olng,
+      destLat,
+      destLng,
+    );
+    return res.json({
+      path: ok ? path : [],
+      ok: Boolean(ok && path?.length),
+      target,
+      duration_seconds: duration_seconds ?? null,
+      distance_meters: distance_meters ?? null,
+    });
+  });
+
+  /** Chat history snapshot (REST fallback so UI always renders something). */
+  app.get('/api/rides/:id/chat', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const gate = await assertRideChatParticipant(supabase, req.params.id, uid);
+    if (!gate.ok) {
+      return res.status(403).json({ error: gate.error });
+    }
+    const snap = rideChatSnapshot(req.params.id);
+    return res.json({
+      ok: true,
+      messages: snap.lines,
+      customerSent: snap.customerSent,
+      captainSent: snap.captainSent,
+      customerMax: snap.customerMax,
+      captainMax: snap.captainMax,
+      role: gate.role,
+    });
+  });
+
+  /** REST send (used when socket flight fails; also broadcasts over sockets). */
+  app.post('/api/rides/:id/chat', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const gate = await assertRideChatParticipant(supabase, req.params.id, uid);
+    if (!gate.ok) {
+      return res.status(403).json({ error: gate.error });
+    }
+    const text = String(req.body?.text ?? '')
+      .trim()
+      .replace(/\s+/g, ' ');
+    if (!text) {
+      return res.status(400).json({ error: 'empty message' });
+    }
+    if (text.length > RIDE_CHAT_LIMITS.RIDE_CHAT_MAX_LEN) {
+      return res.status(400).json({ error: 'message too long' });
+    }
+    const snap = rideChatSnapshot(req.params.id);
+    const side = gate.role;
+    if (side === 'customer' && snap.customerSent >= RIDE_CHAT_LIMITS.RIDE_CHAT_MAX_CUSTOMER) {
+      return res.status(429).json({ error: 'customer limit' });
+    }
+    if (side === 'captain' && snap.captainSent >= RIDE_CHAT_LIMITS.RIDE_CHAT_MAX_CAPTAIN) {
+      return res.status(429).json({ error: 'captain limit' });
+    }
+    const sentAt = new Date().toISOString();
+    const state = appendRideChatLine(req.params.id, { from: side, text, sentAt });
+    if (side === 'customer') {
+      state.customer += 1;
+    } else {
+      state.captain += 1;
+    }
+    try {
+      io?.to(`ride_chat:${req.params.id}`).emit('ride_chat_message', {
+        rideId: req.params.id,
+        from: side,
+        text,
+        sentAt,
+        customerSent: state.customer,
+        captainSent: state.captain,
+      });
+    } catch {
+      /* noop */
+    }
+    return res.json({
+      ok: true,
+      sentAt,
+      from: side,
+      text,
+      customerSent: state.customer,
+      captainSent: state.captain,
+    });
   });
 
   /** Single ride by id — after all static /api/rides/... paths. */

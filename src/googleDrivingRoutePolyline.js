@@ -62,18 +62,18 @@ function decimatePath(points, maxPts) {
  * @param {number} originLng
  * @param {number} destLat
  * @param {number} destLng
- * @returns {Promise<{ path: { latitude: number; longitude: number }[]; ok: boolean }>}
+ * @returns {Promise<{ path: { latitude: number; longitude: number }[]; duration_seconds: number | null; distance_meters: number | null; ok: boolean }>}
  */
 export async function fetchDrivingRoutePolyline(apiKey, originLat, originLng, destLat, destLng) {
   if (!apiKey || typeof apiKey !== 'string') {
-    return { path: [], ok: false };
+    return { path: [], duration_seconds: null, distance_meters: null, ok: false };
   }
   if (
     [originLat, originLng, destLat, destLng].some(
       x => typeof x !== 'number' || Number.isNaN(x) || !Number.isFinite(x),
     )
   ) {
-    return { path: [], ok: false };
+    return { path: [], duration_seconds: null, distance_meters: null, ok: false };
   }
 
   const body = {
@@ -92,7 +92,7 @@ export async function fetchDrivingRoutePolyline(apiKey, originLat, originLng, de
       headers: {
         'Content-Type': 'application/json',
         'X-Goog-Api-Key': apiKey.trim(),
-        'X-Goog-FieldMask': 'routes.polyline',
+        'X-Goog-FieldMask': 'routes.polyline,routes.duration,routes.distanceMeters',
       },
       body: JSON.stringify(body),
     });
@@ -101,20 +101,32 @@ export async function fetchDrivingRoutePolyline(apiKey, originLat, originLng, de
     try {
       data = JSON.parse(text);
     } catch {
-      return { path: [], ok: false };
+      return { path: [], duration_seconds: null, distance_meters: null, ok: false };
     }
     if (!res.ok) {
-      return { path: [], ok: false };
+      return { path: [], duration_seconds: null, distance_meters: null, ok: false };
     }
-    const enc = data?.routes?.[0]?.polyline?.encodedPolyline;
+    const r0 = data?.routes?.[0];
+    const enc = r0?.polyline?.encodedPolyline;
     if (!enc) {
-      return { path: [], ok: false };
+      return { path: [], duration_seconds: null, distance_meters: null, ok: false };
     }
     const raw = decodePolyline(enc);
     const path = decimatePath(raw, 450);
-    return { path, ok: path.length > 0 };
+    let duration_seconds = null;
+    if (typeof r0?.duration === 'string') {
+      const m = r0.duration.match(/^(\d+)(?:\.\d+)?s$/);
+      if (m) {
+        duration_seconds = Number(m[1]);
+      }
+    } else if (typeof r0?.duration === 'number') {
+      duration_seconds = r0.duration;
+    }
+    const distance_meters =
+      typeof r0?.distanceMeters === 'number' && Number.isFinite(r0.distanceMeters) ? r0.distanceMeters : null;
+    return { path, duration_seconds, distance_meters, ok: path.length > 0 };
   } catch {
-    return { path: [], ok: false };
+    return { path: [], duration_seconds: null, distance_meters: null, ok: false };
   } finally {
     clearTimeout(t);
   }

@@ -6,21 +6,50 @@
 const RIDE_CHAT_MAX_CUSTOMER = 10;
 const RIDE_CHAT_MAX_CAPTAIN = 10;
 const RIDE_CHAT_MAX_LEN = 800;
+/** Short-lived in-memory history so late joiners / re-subscribers see recent messages. */
+const RIDE_CHAT_MAX_LINES = 60;
 
-/** @type {Map<string, { customer: number; captain: number }>} */
-const rideChatCounts = new Map();
+/** @type {Map<string, { customer: number; captain: number; lines: { from: 'customer'|'captain'; text: string; sentAt: string }[] }>} */
+const rideChatState = new Map();
 
 function rideChatKey(rideId) {
   return String(rideId ?? '');
 }
 
-function getRideChatCounts(rideId) {
+function getRideChatState(rideId) {
   const k = rideChatKey(rideId);
-  if (!rideChatCounts.has(k)) {
-    rideChatCounts.set(k, { customer: 0, captain: 0 });
+  if (!rideChatState.has(k)) {
+    rideChatState.set(k, { customer: 0, captain: 0, lines: [] });
   }
-  return rideChatCounts.get(k);
+  return rideChatState.get(k);
 }
+
+/** Exported so REST endpoints can share the same in-memory state as sockets. */
+export function appendRideChatLine(rideId, line) {
+  const s = getRideChatState(rideId);
+  s.lines.push(line);
+  if (s.lines.length > RIDE_CHAT_MAX_LINES) {
+    s.lines.splice(0, s.lines.length - RIDE_CHAT_MAX_LINES);
+  }
+  return s;
+}
+
+export function rideChatSnapshot(rideId) {
+  const s = getRideChatState(rideId);
+  return {
+    lines: [...s.lines],
+    customerSent: s.customer,
+    captainSent: s.captain,
+    customerMax: RIDE_CHAT_MAX_CUSTOMER,
+    captainMax: RIDE_CHAT_MAX_CAPTAIN,
+  };
+}
+
+export const RIDE_CHAT_LIMITS = {
+  RIDE_CHAT_MAX_CUSTOMER,
+  RIDE_CHAT_MAX_CAPTAIN,
+  RIDE_CHAT_MAX_LEN,
+};
 
 async function assertRideChatParticipant(supabase, rideId, userId) {
   const { data: ride, error } = await supabase
@@ -31,9 +60,9 @@ async function assertRideChatParticipant(supabase, rideId, userId) {
   if (error || !ride) {
     return { ok: false, error: 'ride not found' };
   }
-  /** Chat only before trip starts (PIN / in_progress). */
-  if (ride.status !== 'accepted') {
-    return { ok: false, error: 'chat only while waiting to start the trip' };
+  /** Chat is available once a captain has accepted and until the trip is completed/cancelled. */
+  if (!['accepted', 'in_progress'].includes(ride.status)) {
+    return { ok: false, error: 'chat only while the trip is active' };
   }
   if (ride.customer_id === userId) {
     return { ok: true, role: 'customer' };
@@ -43,6 +72,8 @@ async function assertRideChatParticipant(supabase, rideId, userId) {
   }
   return { ok: false, error: 'forbidden' };
 }
+
+export { assertRideChatParticipant };
 
 export function attachTripSocket(io, { supabase, getUserIdFromAccessToken }) {
   io.use(async (socket, next) => {
@@ -118,15 +149,16 @@ export function attachTripSocket(io, { supabase, getUserIdFromAccessToken }) {
         }
         return;
       }
-      const c = getRideChatCounts(rideId);
+      const s = getRideChatState(rideId);
       socket.join(`ride_chat:${rideId}`);
       if (typeof cb === 'function') {
         cb({
           ok: true,
-          customerSent: c.customer,
-          captainSent: c.captain,
+          customerSent: s.customer,
+          captainSent: s.captain,
           customerMax: RIDE_CHAT_MAX_CUSTOMER,
           captainMax: RIDE_CHAT_MAX_CAPTAIN,
+          messages: [...s.lines],
         });
       }
     });
@@ -175,49 +207,55 @@ export function attachTripSocket(io, { supabase, getUserIdFromAccessToken }) {
         }
         return;
       }
-      const counts = getRideChatCounts(rideId);
+      const state = getRideChatState(rideId);
       const side = gate.role;
-      if (side === 'customer' && counts.customer >= RIDE_CHAT_MAX_CUSTOMER) {
+      if (side === 'customer' && state.customer >= RIDE_CHAT_MAX_CUSTOMER) {
         if (typeof cb === 'function') {
           cb({
             ok: false,
             error: 'customer limit',
-            customerSent: counts.customer,
-            captainSent: counts.captain,
+            customerSent: state.customer,
+            captainSent: state.captain,
           });
         }
         return;
       }
-      if (side === 'captain' && counts.captain >= RIDE_CHAT_MAX_CAPTAIN) {
+      if (side === 'captain' && state.captain >= RIDE_CHAT_MAX_CAPTAIN) {
         if (typeof cb === 'function') {
           cb({
             ok: false,
             error: 'captain limit',
-            customerSent: counts.customer,
-            captainSent: counts.captain,
+            customerSent: state.customer,
+            captainSent: state.captain,
           });
         }
         return;
       }
       if (side === 'customer') {
-        counts.customer += 1;
+        state.customer += 1;
       } else {
-        counts.captain += 1;
+        state.captain += 1;
       }
       const sentAt = new Date().toISOString();
+      const line = { from: side, text, sentAt };
+      state.lines.push(line);
+      if (state.lines.length > RIDE_CHAT_MAX_LINES) {
+        state.lines.splice(0, state.lines.length - RIDE_CHAT_MAX_LINES);
+      }
       io.to(`ride_chat:${rideId}`).emit('ride_chat_message', {
         rideId,
         from: side,
         text,
         sentAt,
-        customerSent: counts.customer,
-        captainSent: counts.captain,
+        customerSent: state.customer,
+        captainSent: state.captain,
       });
       if (typeof cb === 'function') {
         cb({
           ok: true,
-          customerSent: counts.customer,
-          captainSent: counts.captain,
+          customerSent: state.customer,
+          captainSent: state.captain,
+          sentAt,
         });
       }
     });
