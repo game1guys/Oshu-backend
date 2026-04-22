@@ -126,6 +126,28 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
     const cod = Number(p.captain_cod_total_inr ?? 0);
     const onlineCredited = Number(p.captain_online_credited_total_inr ?? 0);
     const oshuPlatformDue = Number(p.captain_oshu_platform_due_inr ?? 0);
+    const [{ data: qrRows }, { data: personalRows }] = await Promise.all([
+      supabase
+        .from('ride_requests')
+        .select('final_payable_inr')
+        .eq('captain_id', uid)
+        .eq('status', 'completed')
+        .eq('payment_status', 'paid_oshu_qr'),
+      supabase
+        .from('ride_requests')
+        .select('final_payable_inr')
+        .eq('captain_id', uid)
+        .eq('status', 'completed')
+        .or('payment_status.eq.paid_cod,captain_customer_collection.eq.captain_own'),
+    ]);
+    const lifetimeOshuQrCollectedInr = (qrRows ?? []).reduce(
+      (sum, row) => sum + Number(row.final_payable_inr ?? 0),
+      0,
+    );
+    const lifetimePersonalCollectionInr = (personalRows ?? []).reduce(
+      (sum, row) => sum + Number(row.final_payable_inr ?? 0),
+      0,
+    );
     /** Cash / UPI the captain kept directly (COD + withdrawn). */
     const inOwnHands = cod + withdrawn;
 
@@ -141,6 +163,10 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
       lifetime_cod_inr: cod,
       /** INR platform share owed to Oshu (own-UPI collection path). */
       oshu_platform_due_inr: oshuPlatformDue,
+      /** Lifetime total where customer paid Oshu company QR. */
+      lifetime_oshu_qr_collected_inr: lifetimeOshuQrCollectedInr,
+      /** Lifetime total where customer paid captain directly (personal UPI / cash). */
+      lifetime_personal_collection_inr: lifetimePersonalCollectionInr,
       /** Max pending due before new rides are blocked (front-end shows a live meter). */
       oshu_platform_due_cap_inr: CAPTAIN_PLATFORM_DUE_CAP_INR,
       oshu_platform_fee_pct: platformFeePct(),

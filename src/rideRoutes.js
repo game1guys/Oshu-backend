@@ -483,6 +483,29 @@ function emitRide(io, ride) {
   }
 }
 
+async function getRideChatParticipantNames(supabase, rideId) {
+  const { data: ride } = await supabase
+    .from('ride_requests')
+    .select('customer_id, captain_id')
+    .eq('id', rideId)
+    .maybeSingle();
+  if (!ride) {
+    return { customer_name: null, captain_name: null };
+  }
+  const [customerRes, captainRes] = await Promise.all([
+    ride.customer_id
+      ? supabase.from('profiles').select('full_name').eq('id', ride.customer_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+    ride.captain_id
+      ? supabase.from('profiles').select('full_name').eq('id', ride.captain_id).maybeSingle()
+      : Promise.resolve({ data: null }),
+  ]);
+  return {
+    customer_name: customerRes?.data?.full_name ?? null,
+    captain_name: captainRes?.data?.full_name ?? null,
+  };
+}
+
 export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io }) {
   /** Public: per-km rates for a pricing zone. Optional ?pickup_lat=&pickup_lng= resolves zone; else India (in). */
   app.get('/api/pricing', async (req, res) => {
@@ -1874,6 +1897,45 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       .select('lat, lng, updated_at')
       .eq('driver_id', row.captain_id)
       .maybeSingle();
+    let captainPhone = null;
+    let captainName = null;
+    let vehicleType = null;
+    let vehicleModel = null;
+    let vehicleRegistrationNumber = null;
+    if (row.captain_id) {
+      const [{ data: capProfile }, vehicleRes] = await Promise.all([
+        supabase
+          .from('profiles')
+          .select('full_name, phone')
+          .eq('id', row.captain_id)
+          .maybeSingle(),
+        supabase
+          .from('vehicles')
+          .select('*')
+          .eq('driver_id', row.captain_id)
+          .maybeSingle(),
+      ]);
+      const capVehicle = vehicleRes?.data ?? null;
+      captainPhone = capProfile?.phone ?? null;
+      const profileName =
+        typeof capProfile?.full_name === 'string' ? capProfile.full_name.trim() : '';
+      if (profileName) {
+        captainName = profileName;
+      } else if (captainPhone) {
+        const d = String(captainPhone).replace(/\D/g, '');
+        captainName = d ? `Captain ${d.slice(-4)}` : 'Captain';
+      } else {
+        captainName = 'Captain';
+      }
+      vehicleType = capVehicle?.type ?? null;
+      vehicleModel = capVehicle?.model ?? null;
+      vehicleRegistrationNumber =
+        capVehicle?.registration_number ??
+        capVehicle?.license_plate ??
+        capVehicle?.vehicle_number ??
+        capVehicle?.registration_no ??
+        null;
+    }
     let captain_lat = pres?.lat ?? null;
     let captain_lng = pres?.lng ?? null;
     let etaPickup = null;
@@ -1894,7 +1956,14 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       const kmDrop = haversineKm(captain_lat, captain_lng, row.drop_lat, row.drop_lng);
       etaDrop = Math.max(1, Math.ceil((kmDrop / CAPTAIN_ETA_SPEED_KMH) * 60));
     }
-    const rOut = { ...row };
+    const rOut = {
+      ...row,
+      captain_phone: captainPhone,
+      captain_name: captainName,
+      vehicle_type: vehicleType ?? row.vehicle_type,
+      vehicle_model: vehicleModel,
+      vehicle_registration_number: vehicleRegistrationNumber,
+    };
     if (uid === row.captain_id) {
       delete rOut.handshake_pin;
     }
@@ -2019,6 +2088,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(403).json({ error: gate.error });
     }
     const snap = rideChatSnapshot(req.params.id);
+    const names = await getRideChatParticipantNames(supabase, req.params.id);
     return res.json({
       ok: true,
       messages: snap.lines,
@@ -2027,6 +2097,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       customerMax: snap.customerMax,
       captainMax: snap.captainMax,
       role: gate.role,
+      customer_name: names.customer_name,
+      captain_name: names.captain_name,
     });
   });
 
