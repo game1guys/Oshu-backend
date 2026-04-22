@@ -1570,10 +1570,21 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const start = row.ride_started_at ? new Date(row.ride_started_at) : null;
     const included = Math.max(0, Number(row.included_service_minutes ?? 45));
     const rate = Math.max(0, Number(row.overtime_inr_per_min ?? 10));
+    const waitingMinInput = Number(req.body?.waiting_minutes);
+    const hasWaitingInput = Number.isFinite(waitingMinInput) && waitingMinInput >= 0;
     const baseFare = Number(row.quoted_price_inr ?? 0);
     let overtimeMin = 0;
     let overtimeCharge = 0;
-    if (start && !Number.isNaN(start.getTime())) {
+    if (hasWaitingInput) {
+      /**
+       * Manual waiting mode from captain app:
+       * first 45 min free, then ₹3/min charge.
+       */
+      const waitingMin = Math.max(0, Math.floor(waitingMinInput));
+      const extra = Math.max(0, waitingMin - 45);
+      overtimeMin = extra;
+      overtimeCharge = roundMoney(extra * 3);
+    } else if (start && !Number.isNaN(start.getTime())) {
       const durationMin = Math.max(0, Math.ceil((end.getTime() - start.getTime()) / 60000));
       overtimeMin = Math.max(0, durationMin - included);
       overtimeCharge = roundMoney(overtimeMin * rate);
@@ -2272,6 +2283,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(403).json({ error: 'Forbidden' });
     }
     const id = req.params.id;
+    const reasonRaw = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    const cancellationReason = reasonRaw ? reasonRaw.slice(0, 300) : null;
     const { data: row, error: fetchErr } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
     if (fetchErr) {
       return res.status(500).json({ error: fetchErr.message });
@@ -2294,7 +2307,13 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       }
       const { data, error } = await supabase
         .from('ride_requests')
-        .update({ status: 'cancelled', updated_at: at })
+        .update({
+          status: 'cancelled',
+          updated_at: at,
+          cancellation_reason: cancellationReason,
+          cancelled_by_role: 'user',
+          ride_cancelled_at: at,
+        })
         .eq('id', id)
         .eq('customer_id', uid)
         .in('status', ['pending', 'accepted', 'in_progress'])
@@ -2318,7 +2337,13 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     const { data, error } = await supabase
       .from('ride_requests')
-      .update({ status: 'cancelled', updated_at: at })
+      .update({
+        status: 'cancelled',
+        updated_at: at,
+        cancellation_reason: cancellationReason,
+        cancelled_by_role: 'captain',
+        ride_cancelled_at: at,
+      })
       .eq('id', id)
       .eq('captain_id', uid)
       .in('status', ['accepted', 'in_progress'])
