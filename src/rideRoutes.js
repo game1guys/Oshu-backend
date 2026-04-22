@@ -151,8 +151,19 @@ function buildOshuCompanyUpiPayUri(vpaRaw, amountInr, rideId) {
 /** 1% off when customer pays Oshu directly via company UPI QR (not Razorpay checkout). */
 const OSHU_QR_PAY_DISCOUNT_PCT = 1;
 
-/** ₹ per kg of cargo above the vehicle’s max weight capacity (booking-time). */
-const OVERWEIGHT_INR_PER_KG = 2;
+/** ₹ per kg of cargo above base capacity, within additional allowed capacity. */
+const OVERWEIGHT_INR_PER_KG = 0.5;
+
+/** Extra capacity (kg) allowed above max capacity, per vehicle class. */
+const VEHICLE_ADDITIONAL_CAPACITY_KG = {
+  bike: 10,
+  scooter: 10,
+  e_rickshaw: 30,
+  electric_3w: 50,
+  auto: 100,
+  tata_ace: 100,
+  pickup: 200,
+};
 
 function grossPayableInrFromRide(row) {
   const q = Number(row?.quoted_price_inr ?? 0);
@@ -163,17 +174,25 @@ function grossPayableInrFromRide(row) {
   );
 }
 
+function additionalCargoKgForVehicleType(vehicleType) {
+  const n = Number(VEHICLE_ADDITIONAL_CAPACITY_KG[String(vehicleType ?? '')] ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 /** Excess cargo kg above capacity and charge (capacity NaN → no charge). */
-function overweightKgAndCharge(cargoKg, capacityKg) {
+function overweightKgAndCharge(cargoKg, capacityKg, vehicleType) {
   if (cargoKg == null || Number.isNaN(cargoKg) || cargoKg <= 0) {
-    return { excessKg: 0, chargeInr: 0 };
+    return { excessKg: 0, chargeInr: 0, exceedsAllowed: false, additionalAllowedKg: 0, maxAllowedKg: capacityKg };
   }
   if (!Number.isFinite(capacityKg) || capacityKg <= 0) {
-    return { excessKg: 0, chargeInr: 0 };
+    return { excessKg: 0, chargeInr: 0, exceedsAllowed: false, additionalAllowedKg: 0, maxAllowedKg: capacityKg };
   }
+  const additionalAllowedKg = additionalCargoKgForVehicleType(vehicleType);
+  const maxAllowedKg = roundMoney(capacityKg + additionalAllowedKg);
+  const exceedsAllowed = cargoKg > maxAllowedKg;
   const excessKg = Math.max(0, roundMoney(cargoKg - capacityKg));
   const chargeInr = roundMoney(excessKg * OVERWEIGHT_INR_PER_KG);
-  return { excessKg, chargeInr };
+  return { excessKg, chargeInr, exceedsAllowed, additionalAllowedKg, maxAllowedKg };
 }
 
 function escapeHtml(s) {
@@ -188,7 +207,11 @@ function escapeHtml(s) {
 function fmtInr(n) {
   const v = Number(n ?? 0);
   const x = Number.isFinite(v) ? v : 0;
-  return `₹${Math.round(x)}`;
+  const hasPaise = Math.round(x * 100) % 100 !== 0;
+  return `₹${x.toLocaleString('en-IN', {
+    minimumFractionDigits: hasPaise ? 2 : 0,
+    maximumFractionDigits: 2,
+  })}`;
 }
 
 function renderInvoiceHtml({ ride, customer, packaging }) {
@@ -216,7 +239,7 @@ function renderInvoiceHtml({ ride, customer, packaging }) {
 
   const owLabel =
     overweightCh > 0
-      ? `Over-weight cargo — ${Math.round(overweightKg)} kg above ${Number.isFinite(capW) ? String(Math.round(capW)) : '—'} kg limit @ ₹${Math.round(rateOw)}/kg`
+      ? `Over-weight cargo — ${Math.round(overweightKg)} kg above ${Number.isFinite(capW) ? String(Math.round(capW)) : '—'} kg limit @ ₹${rateOw.toFixed(2)}/kg`
       : '';
 
   const items = [
@@ -315,7 +338,7 @@ function renderInvoiceHtml({ ride, customer, packaging }) {
           <div class="note">
             Each line above is part of your fare. Overtime applies after included free service minutes. Toll is
             recorded when the partner completes the job. Over-weight applies when declared weight exceeds the
-            vehicle’s rated capacity (${escapeHtml(String(Math.round(rateOw)))} ₹/kg on the excess).
+            vehicle’s rated capacity (${escapeHtml(String(rateOw.toFixed(2)))} ₹/kg on the excess).
           </div>
         </div>
       </div>
@@ -379,12 +402,12 @@ function totalFromParts(base, packagingFee, manpowerFee) {
  */
 const VEHICLE_PRICING_DEFAULT_MAX_KG = {
   bike: 25,
-  scooter: 35,
-  auto: 200,
-  e_rickshaw: 400,
+  scooter: 25,
+  auto: 500,
+  e_rickshaw: 300,
   electric_3w: 500,
-  tata_ace: 750,
-  pickup: 1000,
+  tata_ace: 700,
+  pickup: 1400,
   mini_truck: 1500,
   truck: 7000,
   canter: 4000,
@@ -1044,10 +1067,14 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       const discount_inr = roundMoney(subtotal * (discountPct / 100));
       const afterDisc = roundMoney(Math.max(0, subtotal - discount_inr));
       const capKg = maxCargoKgForPricingRow(row);
-      const { excessKg, chargeInr } = overweightKgAndCharge(
+      const { excessKg, chargeInr, exceedsAllowed, additionalAllowedKg, maxAllowedKg } = overweightKgAndCharge(
         filterWeightKg != null ? filterWeightKg : NaN,
         Number.isFinite(capKg) ? capKg : NaN,
+        row.vehicle_type,
       );
+      if (filterWeightKg != null && exceedsAllowed) {
+        return null;
+      }
       const trip_subtotal_after_overweight_inr = roundMoney(afterDisc + chargeInr);
       const estimated_price_inr = roundMoney(trip_subtotal_after_overweight_inr + estimated_route_toll_inr);
       return {
@@ -1055,6 +1082,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         price_per_km_inr: Number(row.price_per_km_inr),
         min_fare_inr: Number(row.min_fare_inr ?? 0),
         ...(Number.isFinite(capKg) ? { max_weight_capacity_kg: capKg } : {}),
+        vehicle_additional_capacity_kg: additionalAllowedKg,
+        vehicle_max_total_capacity_kg: Number.isFinite(maxAllowedKg) ? maxAllowedKg : null,
         base_fare_inr,
         packaging_fee_inr,
         manpower_fee_inr,
@@ -1072,7 +1101,12 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         trip_subtotal_after_overweight_inr,
         estimated_price_inr,
       };
-    });
+    }).filter(Boolean);
+    if (filterWeightKg != null && options.length === 0) {
+      return res.status(400).json({
+        error: `Declared cargo weight is above allowed additional-capacity limits.`,
+      });
+    }
     return res.json({
       distance_km,
       estimated_route_toll_inr,
@@ -1190,10 +1224,23 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(400).json({ error: 'Unknown vehicle type for this region' });
     }
     const typeMaxKg = maxCargoKgForPricingRow(priceRow);
-    const { excessKg: cargoOverweightKg, chargeInr: overweightChargeInr } = overweightKgAndCharge(
+    const {
+      excessKg: cargoOverweightKg,
+      chargeInr: overweightChargeInr,
+      exceedsAllowed,
+      additionalAllowedKg,
+      maxAllowedKg,
+    } = overweightKgAndCharge(
       weight_kg != null && !Number.isNaN(weight_kg) && weight_kg > 0 ? weight_kg : NaN,
       Number.isFinite(typeMaxKg) ? typeMaxKg : NaN,
+      vehicle_type,
     );
+    if (weight_kg != null && !Number.isNaN(weight_kg) && Number.isFinite(maxAllowedKg) && exceedsAllowed) {
+      return res.status(400).json({
+        error:
+          `Selected vehicle allows max ${Math.round(typeMaxKg)} kg + additional ${Math.round(additionalAllowedKg)} kg only.`,
+      });
+    }
     const base_fare_inr = quoteFromRow(distance_km, priceRow);
     const subtotal_before_discount_inr = totalFromParts(base_fare_inr, packaging_fee_inr, manpower_fee_inr);
     const discount_inr = roundMoney(subtotal_before_discount_inr * (discountPct / 100));
