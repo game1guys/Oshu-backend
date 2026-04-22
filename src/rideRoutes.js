@@ -2173,6 +2173,68 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     });
   });
 
+  /** Customer: rate assigned captain after ride completion (1..5). */
+  app.post('/api/rides/:id/rate-captain', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const profile = await getProfile(supabase, uid);
+    if (!profile || profile.role !== 'user') {
+      return res.status(403).json({ error: 'Customers only' });
+    }
+    const id = req.params.id;
+    const rating = Number(req.body?.rating);
+    const noteRaw = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
+    const note = noteRaw ? noteRaw.slice(0, 400) : null;
+    if (!Number.isFinite(rating) || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: 'rating must be 1 to 5' });
+    }
+    const { data: row, error: rowErr } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (rowErr) {
+      return res.status(500).json({ error: rowErr.message });
+    }
+    if (!row || row.customer_id !== uid) {
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (row.status !== 'completed') {
+      return res.status(409).json({ error: 'Ride must be completed before rating' });
+    }
+    if (!row.captain_id) {
+      return res.status(409).json({ error: 'No captain assigned on this ride' });
+    }
+    if (row.captain_rating != null) {
+      return res.status(409).json({ error: 'Captain already rated for this ride' });
+    }
+    const at = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('ride_requests')
+      .update({
+        captain_rating: Math.round(rating),
+        captain_rating_note: note,
+        captain_rated_at: at,
+        updated_at: at,
+      })
+      .eq('id', id)
+      .eq('customer_id', uid)
+      .eq('status', 'completed')
+      .is('captain_rating', null)
+      .select('*')
+      .maybeSingle();
+    if (error) {
+      return res.status(500).json({ error: error.message });
+    }
+    if (!data) {
+      return res.status(409).json({ error: 'Could not save rating' });
+    }
+    emitRide(io, data);
+    return res.json({ ride: data });
+  });
+
   /** Single ride by id — after all static /api/rides/... paths. */
   app.get('/api/rides/:id', async (req, res) => {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
