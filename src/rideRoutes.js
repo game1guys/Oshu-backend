@@ -424,12 +424,13 @@ const VEHICLE_PRICING_DEFAULT_MAX_KG = {
 };
 
 function maxCargoKgForPricingRow(row) {
-  const fromDb = Number(row.max_weight_capacity_kg);
-  if (Number.isFinite(fromDb) && fromDb > 0) {
-    return fromDb;
+  // Keep capacities aligned with the approved sheet regardless of stale DB values.
+  const canonical = VEHICLE_PRICING_DEFAULT_MAX_KG[row.vehicle_type];
+  if (typeof canonical === 'number' && canonical > 0) {
+    return canonical;
   }
-  const fb = VEHICLE_PRICING_DEFAULT_MAX_KG[row.vehicle_type];
-  return typeof fb === 'number' ? fb : NaN;
+  const fromDb = Number(row.max_weight_capacity_kg);
+  return Number.isFinite(fromDb) && fromDb > 0 ? fromDb : NaN;
 }
 
 async function resolvePackaging(supabase, packagingTypeId) {
@@ -475,8 +476,11 @@ async function notifyCaptainsNearby(io, supabase, ride) {
   if (!io || !supabase || ride?.pickup_lat == null) {
     return;
   }
-  /** Match captains who are still “live” for dispatch; keep in sync with client presence cadence. */
-  const staleBefore = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  /**
+   * Match captains who are still "live" for dispatch.
+   * Keep this tight so offline captains stop receiving offers quickly.
+   */
+  const staleBefore = new Date(Date.now() - 3 * 60 * 1000).toISOString();
   const { data: presences, error } = await supabase
     .from('captain_presence')
     .select('driver_id, lat, lng')
