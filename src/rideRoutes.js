@@ -1932,15 +1932,51 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     if (row.customer_id !== uid && row.captain_id !== uid) {
       return res.status(403).json({ error: 'Forbidden' });
     }
-    if (!['accepted', 'in_progress'].includes(row.status)) {
-      return res.status(400).json({ error: 'Live route is only available while the trip is accepted or in progress' });
+    const toRaw = String(req.query.to ?? '').toLowerCase();
+    /** Customer map: full pickup→drop driving route while still searching for a captain. */
+    const isCustomerTripPreview =
+      row.status === 'pending' && row.customer_id === uid && toRaw === 'trip';
+
+    if (!['accepted', 'in_progress'].includes(row.status) && !isCustomerTripPreview) {
+      return res.status(400).json({
+        error:
+          'Live route is only available while the trip is accepted or in progress (or add ?to=trip as the booking customer while status is pending).',
+      });
     }
+
+    if (isCustomerTripPreview) {
+      const plat = Number(row.pickup_lat);
+      const plng = Number(row.pickup_lng);
+      const dlat = Number(row.drop_lat);
+      const dlng = Number(row.drop_lng);
+      if (!Number.isFinite(plat) || !Number.isFinite(plng) || !Number.isFinite(dlat) || !Number.isFinite(dlng)) {
+        return res.status(400).json({ error: 'Pickup or drop location missing' });
+      }
+      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+      if (!apiKey) {
+        return res.status(503).json({ error: 'Routing not configured', path: [], ok: false });
+      }
+      const { path, ok, duration_seconds, distance_meters } = await fetchDrivingRoutePolyline(
+        apiKey,
+        plat,
+        plng,
+        dlat,
+        dlng,
+      );
+      return res.json({
+        path: ok ? path : [],
+        ok: Boolean(ok && path?.length),
+        target: 'trip',
+        duration_seconds: duration_seconds ?? null,
+        distance_meters: distance_meters ?? null,
+      });
+    }
+
     const olat = parseFloat(String(req.query.olat ?? ''));
     const olng = parseFloat(String(req.query.olng ?? ''));
     if (Number.isNaN(olat) || Number.isNaN(olng)) {
       return res.status(400).json({ error: 'olat and olng required' });
     }
-    const toRaw = String(req.query.to ?? '').toLowerCase();
     const target =
       toRaw === 'pickup' ? 'pickup' : toRaw === 'drop' ? 'drop' : row.status === 'accepted' ? 'pickup' : 'drop';
     const destLat = target === 'pickup' ? row.pickup_lat : row.drop_lat;
