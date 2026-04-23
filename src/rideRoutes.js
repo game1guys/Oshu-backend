@@ -2100,6 +2100,12 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       customer_user_type: customerUserType,
       customer_trade_photo_url: customerTradePhotoUrl,
     };
+    if (row.status === 'completed' && row.payment_status === 'awaiting_payment') {
+      const companyVpa = normalizeUpiVpa(process.env.OSHU_COMPANY_UPI_VPA);
+      rOut.oshu_company_upi_pay_uri = buildOshuCompanyUpiPayUri(companyVpa, row.final_payable_inr, row.id);
+    } else {
+      rOut.oshu_company_upi_pay_uri = null;
+    }
     if (uid === row.captain_id) {
       delete rOut.handshake_pin;
     }
