@@ -1013,7 +1013,23 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     if ([pickup_lat, pickup_lng, drop_lat, drop_lng].some(x => Number.isNaN(x))) {
       return res.status(400).json({ error: 'Invalid coordinates' });
     }
-    const distance_km = roundMoney(haversineKm(pickup_lat, pickup_lng, drop_lat, drop_lng));
+    // Multi-stop: sum distances across all legs.
+    const waypointsRaw = Array.isArray(b.waypoints) ? b.waypoints : [];
+    const validWaypoints = waypointsRaw.filter(
+      w => w && Number.isFinite(Number(w.lat)) && Number.isFinite(Number(w.lng)),
+    ).map(w => ({ lat: Number(w.lat), lng: Number(w.lng) }));
+    const allPoints = [
+      { lat: pickup_lat, lng: pickup_lng },
+      { lat: drop_lat, lng: drop_lng },
+      ...validWaypoints,
+    ];
+    const distance_km = roundMoney(
+      allPoints.reduce((sum, pt, i) => {
+        if (i === 0) return sum;
+        const prev = allPoints[i - 1];
+        return sum + haversineKm(prev.lat, prev.lng, pt.lat, pt.lng);
+      }, 0),
+    );
     const bq = req.body ?? {};
     const packaging_type_id =
       typeof bq.packaging_type_id === 'string' && bq.packaging_type_id.trim() ? bq.packaging_type_id.trim() : null;
@@ -1189,6 +1205,12 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const loading_charge_inr = Math.max(0, Math.round(Number(b.loading_charge_inr ?? 0)));
     const unloading_charge_inr = Math.max(0, Math.round(Number(b.unloading_charge_inr ?? 0)));
     const coins_to_redeem = Math.max(0, Math.floor(Number(b.coins_to_redeem ?? 0)));
+    // Parse intra-city multi-stop waypoints.
+    const waypointsInput = Array.isArray(b.waypoints) ? b.waypoints : [];
+    const validWaypoints = waypointsInput.filter(
+      w => w && Number.isFinite(Number(w.lat)) && Number.isFinite(Number(w.lng)),
+    ).map(w => ({ lat: Number(w.lat), lng: Number(w.lng), address: typeof w.address === 'string' ? w.address : null }));
+    const waypointsJson = validWaypoints.length > 0 ? validWaypoints : null;
     const ppmRaw = b.preferred_payment_method;
     const preferred_payment_method =
       typeof ppmRaw === 'string' && ['cod', 'upi', 'oshu_wallet'].includes(ppmRaw.trim())
@@ -1217,7 +1239,19 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const packaging_fee_inr = packResolved.fee;
     const manpowerInr = await loadManpowerInr(supabase);
     const manpower_fee_inr = manpower_requested ? manpowerInr : 0;
-    const distance_km = roundMoney(haversineKm(pickup_lat, pickup_lng, drop_lat, drop_lng));
+    // Multi-stop: sum distances across all legs.
+    const allPointsCreate = [
+      { lat: pickup_lat, lng: pickup_lng },
+      { lat: drop_lat, lng: drop_lng },
+      ...(waypointsJson ?? []),
+    ];
+    const distance_km = roundMoney(
+      allPointsCreate.reduce((sum, pt, i) => {
+        if (i === 0) return sum;
+        const prev = allPointsCreate[i - 1];
+        return sum + haversineKm(prev.lat, prev.lng, pt.lat, pt.lng);
+      }, 0),
+    );
     const pricingZoneId = await resolvePricingZoneId(supabase, pickup_lat, pickup_lng);
     if (!pricingZoneId) {
       return res.status(400).json({
@@ -1321,6 +1355,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
         handshake_pin,
         included_service_minutes: svcDefaults.includedMin,
         overtime_inr_per_min: svcDefaults.overtimePerMin,
+        waypoints: waypointsJson,
       })
       .select('*')
       .single();
