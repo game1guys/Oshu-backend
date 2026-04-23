@@ -264,6 +264,18 @@ devRouter.post('/customer-personalization', async (req, res) => {
     return res.status(401).json({ error: 'Invalid token' });
   }
   const b = req.body ?? {};
+  async function uploadToAvatars(path, b64, contentType = 'image/jpeg') {
+    const buf = Buffer.from(b64, 'base64');
+    const { error } = await supabase.storage.from('avatars').upload(path, buf, {
+      contentType,
+      upsert: true,
+    });
+    if (error) {
+      throw new Error(error.message);
+    }
+    const { data } = supabase.storage.from('avatars').getPublicUrl(path);
+    return data.publicUrl;
+  }
   const userType = b.customer_user_type;
   if (userType !== 'individual' && userType !== 'seller') {
     return res.status(400).json({ error: 'customer_user_type must be individual or seller' });
@@ -285,8 +297,20 @@ devRouter.post('/customer-personalization', async (req, res) => {
     }
     payload.customer_monthly_order_range = range;
     payload.full_name = name;
+    if (typeof b.customer_trade_photo_base64 !== 'string' || b.customer_trade_photo_base64.trim().length < 16) {
+      return res.status(400).json({ error: 'seller requires customer_trade_photo_base64' });
+    }
+    try {
+      payload.customer_trade_photo_url = await uploadToAvatars(
+        `${uid}/customer/trade-unit.jpg`,
+        b.customer_trade_photo_base64.trim(),
+      );
+    } catch (e) {
+      return res.status(500).json({ error: e?.message ?? 'trade image upload failed' });
+    }
   } else {
     payload.customer_monthly_order_range = null;
+    payload.customer_trade_photo_url = null;
   }
   const { error: upErr } = await supabase.from('profiles').update(payload).eq('id', uid);
   if (upErr) {

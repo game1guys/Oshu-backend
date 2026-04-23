@@ -2022,6 +2022,17 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     let vehicleType = null;
     let vehicleModel = null;
     let vehicleRegistrationNumber = null;
+    let customerUserType = null;
+    let customerTradePhotoUrl = null;
+    if (row.customer_id) {
+      const { data: customerProfile } = await supabase
+        .from('profiles')
+        .select('customer_user_type, customer_trade_photo_url')
+        .eq('id', row.customer_id)
+        .maybeSingle();
+      customerUserType = customerProfile?.customer_user_type ?? null;
+      customerTradePhotoUrl = customerProfile?.customer_trade_photo_url ?? null;
+    }
     if (row.captain_id) {
       const [{ data: capProfile }, vehicleRes] = await Promise.all([
         supabase
@@ -2083,6 +2094,8 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       vehicle_type: vehicleType ?? row.vehicle_type,
       vehicle_model: vehicleModel,
       vehicle_registration_number: vehicleRegistrationNumber,
+      customer_user_type: customerUserType,
+      customer_trade_photo_url: customerTradePhotoUrl,
     };
     if (uid === row.captain_id) {
       delete rOut.handshake_pin;
