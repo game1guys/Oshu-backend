@@ -2022,6 +2022,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     let vehicleType = null;
     let vehicleModel = null;
     let vehicleRegistrationNumber = null;
+    let vehiclePhotos = null;
     let customerUserType = null;
     let customerTradePhotoUrl = null;
     if (row.customer_id) {
@@ -2060,6 +2061,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       }
       vehicleType = capVehicle?.type ?? null;
       vehicleModel = capVehicle?.model ?? null;
+      vehiclePhotos = capVehicle?.photos ?? null;
       vehicleRegistrationNumber =
         capVehicle?.registration_number ??
         capVehicle?.license_plate ??
@@ -2094,6 +2096,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       vehicle_type: vehicleType ?? row.vehicle_type,
       vehicle_model: vehicleModel,
       vehicle_registration_number: vehicleRegistrationNumber,
+      vehicle_photos: vehiclePhotos,
       customer_user_type: customerUserType,
       customer_trade_photo_url: customerTradePhotoUrl,
     };
