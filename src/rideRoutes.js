@@ -8,6 +8,7 @@ import {
   isPlausibleUpiVpa,
   normalizeUpiVpa,
   platformFeePct,
+  resolveOshuCompanyMerchantVpa,
 } from './walletUtils.js';
 import { fetchDrivingRoutePolyline } from './googleDrivingRoutePolyline.js';
 import { fetchRouteTollEstimateInr } from './googleRouteTollEstimate.js';
@@ -1726,7 +1727,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       return res.status(409).json({ error: 'Cannot complete' });
     }
     emitRide(io, data);
-    const companyVpa = normalizeUpiVpa(process.env.OSHU_COMPANY_UPI_VPA);
+    const companyVpa = resolveOshuCompanyMerchantVpa();
     const oshu_company_upi_pay_uri = buildOshuCompanyUpiPayUri(companyVpa, finalPayable, data.id);
     return res.json({
       ride: data,
@@ -2001,6 +2002,12 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     if (!row.captain_id || !['accepted', 'in_progress'].includes(row.status)) {
       const r0 = { ...row };
+      if (row.status === 'completed' && row.payment_status === 'awaiting_payment') {
+        const companyVpa = resolveOshuCompanyMerchantVpa();
+        r0.oshu_company_upi_pay_uri = buildOshuCompanyUpiPayUri(companyVpa, row.final_payable_inr, row.id);
+      } else {
+        r0.oshu_company_upi_pay_uri = null;
+      }
       if (uid === row.captain_id) {
         delete r0.handshake_pin;
       }
@@ -2101,7 +2108,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       customer_trade_photo_url: customerTradePhotoUrl,
     };
     if (row.status === 'completed' && row.payment_status === 'awaiting_payment') {
-      const companyVpa = normalizeUpiVpa(process.env.OSHU_COMPANY_UPI_VPA);
+      const companyVpa = resolveOshuCompanyMerchantVpa();
       rOut.oshu_company_upi_pay_uri = buildOshuCompanyUpiPayUri(companyVpa, row.final_payable_inr, row.id);
     } else {
       rOut.oshu_company_upi_pay_uri = null;

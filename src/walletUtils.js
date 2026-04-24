@@ -41,5 +41,18 @@ export function isPlausibleUpiVpa(v) {
   if (at <= 0 || at === s.length - 1) {
     return false;
   }
-  return /^[a-z0-9._-]+@[a-z0-9.-]+$/.test(s);
+  /** Local part may include `+` (tagged addresses) and digits. */
+  return /^[a-z0-9._+-]+@[a-z0-9.-]+$/.test(s);
+}
+
+/**
+ * Oshu company collect VPA from env (Node). Several names supported so deploys don’t silently misspay links.
+ */
+export function resolveOshuCompanyMerchantVpa() {
+  const raw =
+    process.env.OSHU_COMPANY_UPI_VPA ||
+    process.env.OSHU_MERCHANT_UPI_VPA ||
+    process.env.OSHU_UPI_MERCHANT_VPA ||
+    '';
+  return normalizeUpiVpa(raw);
 }
