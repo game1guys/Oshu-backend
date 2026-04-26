@@ -465,6 +465,11 @@ async function resolvePackaging(supabase, packagingTypeId) {
 const DISPATCH_RADIUS_KM = 5;
 /** Rough urban speed for ETA captain → pickup (km/h). */
 const CAPTAIN_ETA_SPEED_KMH = 25;
+/** Do not surface stale pending rides in captain open-request feed. */
+const CAPTAIN_PENDING_MAX_AGE_MIN = Math.max(
+  1,
+  Number(process.env.CAPTAIN_PENDING_MAX_AGE_MIN ?? 15) || 15,
+);
 
 function genHandshakePin() {
   return String(1000 + Math.floor(Math.random() * 9000));
@@ -1450,11 +1455,13 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     if (!myVehicle?.type) {
       return res.status(400).json({ error: 'Register your vehicle before accepting jobs' });
     }
+    const freshPendingBefore = new Date(Date.now() - CAPTAIN_PENDING_MAX_AGE_MIN * 60 * 1000).toISOString();
     const { data: rows, error } = await supabase
       .from('ride_requests')
       .select('*')
       .eq('status', 'pending')
       .eq('vehicle_type', myVehicle.type)
+      .gte('created_at', freshPendingBefore)
       .order('created_at', { ascending: true })
       .limit(80);
     if (error) {
