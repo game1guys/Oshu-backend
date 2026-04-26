@@ -86,6 +86,58 @@ app.use(cors());
 registerRazorpayWebhook(app, supabase);
 app.use(express.json({ limit: '50mb' }));
 
+/**
+ * Captain single-device guard:
+ * if a captain logs in on a new device, old devices are rejected on subsequent API calls.
+ */
+app.use('/api', async (req, res, next) => {
+  try {
+    const p = String(req.path ?? '');
+    if (
+      p.startsWith('/dev/') ||
+      p === '/health' ||
+      p === '/db/health' ||
+      p === '/auth/bootstrap' ||
+      p === '/auth/device-login' ||
+      p.startsWith('/webhooks/')
+    ) {
+      return next();
+    }
+    const auth = req.headers.authorization;
+    const token = typeof auth === 'string' ? auth.replace(/^Bearer\s+/i, '').trim() : '';
+    if (!token || !supabase) {
+      return next();
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return next();
+    }
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role, active_device_id')
+      .eq('id', uid)
+      .maybeSingle();
+    if (!profile || profile.role !== 'captain') {
+      return next();
+    }
+    const activeDeviceId = String(profile.active_device_id ?? '').trim();
+    if (!activeDeviceId) {
+      return next();
+    }
+    const reqDeviceId = String(req.headers['x-oshu-device-id'] ?? '').trim();
+    if (!reqDeviceId || reqDeviceId !== activeDeviceId) {
+      res.setHeader('X-Oshu-Force-Logout', '1');
+      return res.status(401).json({
+        error: 'Session moved to another device. Please login again on this device.',
+        code: 'captain_session_replaced',
+      });
+    }
+    return next();
+  } catch {
+    return next();
+  }
+});
+
 registerKycRoutes(app, { supabase, getUserIdFromAccessToken });
 registerTripRoutes(app, { supabase, getUserIdFromAccessToken });
 registerPresenceRoutes(app, { supabase, getUserIdFromAccessToken });

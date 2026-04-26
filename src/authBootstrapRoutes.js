@@ -128,4 +128,83 @@ export function registerAuthBootstrapRoutes(app, { supabase, getUserIdFromAccess
       vehicle,
     });
   });
+
+  /**
+   * Captain single-device session registration.
+   * The most recently logged-in captain device becomes active; older devices are force-logged-out on next API call.
+   */
+  app.post('/api/auth/device-login', async (req, res) => {
+    if (!supabase) {
+      return res.status(503).json({ error: 'Supabase not configured' });
+    }
+    const token = bearerToken(req);
+    if (!token) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const deviceId = String(req.body?.device_id ?? '').trim();
+    if (!deviceId) {
+      return res.status(400).json({ error: 'device_id is required' });
+    }
+    const deviceLabel = String(req.body?.device_label ?? '').trim() || null;
+    const latRaw = Number(req.body?.lat);
+    const lngRaw = Number(req.body?.lng);
+    const hasCoords = Number.isFinite(latRaw) && Number.isFinite(lngRaw);
+
+    const { data: profile, error: pErr } = await supabase
+      .from('profiles')
+      .select('id, role')
+      .eq('id', uid)
+      .maybeSingle();
+    if (pErr) {
+      return res.status(500).json({ error: pErr.message });
+    }
+    if (!profile) {
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+
+    // Driver/captain enforcement: only captains are single-device locked.
+    if (profile.role !== 'captain') {
+      return res.json({ ok: true, enforced: false });
+    }
+
+    let lat = hasCoords ? latRaw : null;
+    let lng = hasCoords ? lngRaw : null;
+    if (lat == null || lng == null) {
+      const { data: lastPresence } = await supabase
+        .from('captain_presence')
+        .select('lat, lng')
+        .eq('driver_id', uid)
+        .order('updated_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      lat = Number.isFinite(Number(lastPresence?.lat)) ? Number(lastPresence?.lat) : null;
+      lng = Number.isFinite(Number(lastPresence?.lng)) ? Number(lastPresence?.lng) : null;
+    }
+
+    const nowIso = new Date().toISOString();
+    const payload = {
+      active_device_id: deviceId,
+      last_login_device_id: deviceId,
+      last_login_device_label: deviceLabel,
+      last_login_lat: lat,
+      last_login_lng: lng,
+      last_login_at: nowIso,
+    };
+    const { error: upErr } = await supabase.from('profiles').update(payload).eq('id', uid);
+    if (upErr) {
+      return res.status(500).json({ error: upErr.message });
+    }
+    return res.json({
+      ok: true,
+      enforced: true,
+      active_device_id: deviceId,
+      last_login_at: nowIso,
+      last_login_lat: lat,
+      last_login_lng: lng,
+    });
+  });
 }
