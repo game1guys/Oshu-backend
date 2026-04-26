@@ -8,6 +8,17 @@ const CAPTAIN_PLATFORM_DUE_CAP_INR = Math.max(
   0,
   Number(process.env.OSHU_CAPTAIN_PLATFORM_DUE_CAP_INR ?? 1000) || 1000,
 );
+const WITHDRAW_COINS_DAILY_LIMIT = 20;
+const WITHDRAW_COINS_BONUS_INR = 20;
+
+function istDayRangeUtc(now = new Date()) {
+  const IST_OFFSET_MS = 330 * 60 * 1000;
+  const shifted = new Date(now.getTime() + IST_OFFSET_MS);
+  shifted.setUTCHours(0, 0, 0, 0);
+  const start = new Date(shifted.getTime() - IST_OFFSET_MS);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
 
 async function razorpayPost(path, body) {
   const key_id = process.env.RAZORPAY_KEY_ID;
@@ -110,7 +121,7 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
     const { data: p, error } = await supabase
       .from('profiles')
       .select(
-        'id, role, captain_wallet_balance_inr, captain_wallet_withdrawn_total_inr, captain_cod_total_inr, captain_online_credited_total_inr, captain_wallet_upi_id, captain_oshu_platform_due_inr',
+        'id, role, captain_wallet_balance_inr, captain_wallet_withdrawn_total_inr, captain_cod_total_inr, captain_online_credited_total_inr, captain_wallet_upi_id, captain_oshu_platform_due_inr, coin_balance',
       )
       .eq('id', uid)
       .maybeSingle();
@@ -126,6 +137,17 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
     const cod = Number(p.captain_cod_total_inr ?? 0);
     const onlineCredited = Number(p.captain_online_credited_total_inr ?? 0);
     const oshuPlatformDue = Number(p.captain_oshu_platform_due_inr ?? 0);
+    const coinBalance = Number(p.coin_balance ?? 0);
+    const { startIso, endIso } = istDayRangeUtc();
+    const { data: usedCoinRows } = await supabase
+      .from('coin_transactions')
+      .select('id')
+      .eq('user_id', uid)
+      .eq('type', 'captain_withdraw_bonus_redeem')
+      .gte('created_at', startIso)
+      .lt('created_at', endIso)
+      .limit(1);
+    const withdrawBonusUsedToday = (usedCoinRows ?? []).length > 0;
     const [{ data: qrRows }, { data: personalRows }] = await Promise.all([
       supabase
         .from('ride_requests')
@@ -176,6 +198,11 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
       /** Same VPA the captain saved (only returned to the signed-in captain). */
       saved_upi_vpa: savedVpa,
       min_withdraw_inr: minWithdrawInr(),
+      coin_balance: coinBalance,
+      withdraw_bonus_coins_required: WITHDRAW_COINS_DAILY_LIMIT,
+      withdraw_bonus_inr: WITHDRAW_COINS_BONUS_INR,
+      withdraw_bonus_used_today: withdrawBonusUsedToday,
+      withdraw_bonus_coins_remaining_today: withdrawBonusUsedToday ? 0 : WITHDRAW_COINS_DAILY_LIMIT,
       razorpay_configured: Boolean(process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET),
       payouts_configured: Boolean(process.env.RAZORPAY_PAYOUT_ACCOUNT_NUMBER),
     });
@@ -278,7 +305,7 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
     const { data: profile, error: pErr } = await supabase
       .from('profiles')
       .select(
-        'id, role, full_name, phone, captain_wallet_balance_inr, captain_wallet_upi_id, razorpay_contact_id, razorpay_fund_account_id',
+        'id, role, full_name, phone, captain_wallet_balance_inr, captain_wallet_upi_id, razorpay_contact_id, razorpay_fund_account_id, coin_balance',
       )
       .eq('id', uid)
       .maybeSingle();
@@ -300,6 +327,26 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
     }
     if (!isPlausibleUpiVpa(profile.captain_wallet_upi_id)) {
       return res.status(400).json({ error: 'Save your UPI ID in the app before withdrawing' });
+    }
+    const useCoinsBonus = Boolean(req.body?.use_coins_bonus);
+    const bonusInr = useCoinsBonus ? WITHDRAW_COINS_BONUS_INR : 0;
+    if (useCoinsBonus) {
+      const { startIso, endIso } = istDayRangeUtc();
+      const { data: usedRows } = await supabase
+        .from('coin_transactions')
+        .select('id')
+        .eq('user_id', uid)
+        .eq('type', 'captain_withdraw_bonus_redeem')
+        .gte('created_at', startIso)
+        .lt('created_at', endIso)
+        .limit(1);
+      if ((usedRows ?? []).length > 0) {
+        return res.status(409).json({ error: 'Coins for withdraw bonus can be used only once per day' });
+      }
+      const coinBalance = Number(profile.coin_balance ?? 0);
+      if (coinBalance < WITHDRAW_COINS_DAILY_LIMIT) {
+        return res.status(400).json({ error: `At least ${WITHDRAW_COINS_DAILY_LIMIT} coins are required` });
+      }
     }
 
     const payoutAccount = process.env.RAZORPAY_PAYOUT_ACCOUNT_NUMBER;
@@ -331,7 +378,38 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
       return res.status(500).json({ error: 'No ledger id' });
     }
 
-    const paise = Math.round(amt * 100);
+    let coinsDeducted = false;
+    if (useCoinsBonus) {
+      const { error: decErr } = await supabase.rpc('decrement_coin_balance', {
+        uid,
+        delta: WITHDRAW_COINS_DAILY_LIMIT,
+      });
+      if (decErr) {
+        await supabase.rpc('release_captain_withdrawal_reserve', {
+          p_ledger_id: ledgerId,
+          p_captain_id: uid,
+        });
+        return res.status(500).json({ error: decErr.message });
+      }
+      const { error: txErr } = await supabase.from('coin_transactions').insert({
+        user_id: uid,
+        coins: -WITHDRAW_COINS_DAILY_LIMIT,
+        type: 'captain_withdraw_bonus_redeem',
+        description: `Withdraw bonus used: ${WITHDRAW_COINS_DAILY_LIMIT} coins (+₹${WITHDRAW_COINS_BONUS_INR})`,
+      });
+      if (txErr) {
+        await supabase.rpc('increment_coin_balance', { uid, delta: WITHDRAW_COINS_DAILY_LIMIT });
+        await supabase.rpc('release_captain_withdrawal_reserve', {
+          p_ledger_id: ledgerId,
+          p_captain_id: uid,
+        });
+        return res.status(500).json({ error: txErr.message });
+      }
+      coinsDeducted = true;
+    }
+
+    const payoutInr = amt + bonusInr;
+    const paise = Math.round(payoutInr * 100);
     const payoutBody = {
       account_number: payoutAccount,
       fund_account_id: ensured.fundId,
@@ -350,6 +428,15 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
         p_ledger_id: ledgerId,
         p_captain_id: uid,
       });
+      if (coinsDeducted) {
+        await supabase.rpc('increment_coin_balance', { uid, delta: WITHDRAW_COINS_DAILY_LIMIT });
+        await supabase.from('coin_transactions').insert({
+          user_id: uid,
+          coins: WITHDRAW_COINS_DAILY_LIMIT,
+          type: 'captain_withdraw_bonus_reversal',
+          description: `Reversal: withdraw bonus coins refunded for failed payout`,
+        });
+      }
       return res.status(502).json({ error: pay.error ?? 'Payout failed' });
     }
 
@@ -359,6 +446,15 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
         p_ledger_id: ledgerId,
         p_captain_id: uid,
       });
+      if (coinsDeducted) {
+        await supabase.rpc('increment_coin_balance', { uid, delta: WITHDRAW_COINS_DAILY_LIMIT });
+        await supabase.from('coin_transactions').insert({
+          user_id: uid,
+          coins: WITHDRAW_COINS_DAILY_LIMIT,
+          type: 'captain_withdraw_bonus_reversal',
+          description: `Reversal: withdraw bonus coins refunded (missing payout id)`,
+        });
+      }
       return res.status(502).json({ error: 'Payout response missing id' });
     }
 
@@ -376,6 +472,13 @@ export function registerCaptainWalletRoutes(app, { supabase, getUserIdFromAccess
       return res.status(500).json({ error: crow.error ?? 'Confirm failed' });
     }
 
-    return res.json({ ok: true, razorpay_payout_id: payoutId, amount_inr: amt });
+    return res.json({
+      ok: true,
+      razorpay_payout_id: payoutId,
+      amount_inr: amt,
+      payout_amount_inr: payoutInr,
+      coins_used: useCoinsBonus ? WITHDRAW_COINS_DAILY_LIMIT : 0,
+      bonus_inr: bonusInr,
+    });
   });
 }

@@ -151,6 +151,7 @@ function buildOshuCompanyUpiPayUri(vpaRaw, amountInr, rideId) {
 
 /** 1% off when customer pays Oshu directly via company UPI QR (not Razorpay checkout). */
 const OSHU_QR_PAY_DISCOUNT_PCT = 1;
+const PAYMENT_COINS_DAILY_LIMIT = 20;
 
 /** ₹ per kg of cargo above base capacity, within additional allowed capacity. */
 const OVERWEIGHT_INR_PER_KG = 0.5;
@@ -179,6 +180,15 @@ function grossPayableInrFromRide(row) {
 function additionalCargoKgForVehicleType(vehicleType) {
   const n = Number(VEHICLE_ADDITIONAL_CAPACITY_KG[String(vehicleType ?? '')] ?? 0);
   return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function istDayRangeUtc(now = new Date()) {
+  const IST_OFFSET_MS = 330 * 60 * 1000;
+  const shifted = new Date(now.getTime() + IST_OFFSET_MS);
+  shifted.setUTCHours(0, 0, 0, 0);
+  const start = new Date(shifted.getTime() - IST_OFFSET_MS);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
 }
 
 /** Excess cargo kg above capacity and charge (capacity NaN → no charge). */
@@ -1899,6 +1909,131 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     }
     emitRide(io, data);
     return res.json({ ride: data });
+  });
+
+  /**
+   * Customer: one-time daily coin usage at payment time.
+   * Rule: max 20 coins/day, only once per day, 1 coin = ₹1.
+   */
+  app.post('/api/rides/:id/apply-payment-coins', async (req, res) => {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
+    if (!token || !supabase) {
+      return res.status(400).json({ error: 'Missing Authorization' });
+    }
+    const uid = await getUserIdFromAccessToken(token);
+    if (!uid) {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    const profile = await getProfile(supabase, uid);
+    if (!profile || profile.role !== 'user') {
+      return res.status(403).json({ error: 'Customers only' });
+    }
+    const id = req.params.id;
+    const { data: row, error: rowErr } = await supabase.from('ride_requests').select('*').eq('id', id).maybeSingle();
+    if (rowErr) {
+      return res.status(500).json({ error: rowErr.message });
+    }
+    if (!row || row.customer_id !== uid) {
+      return res.status(404).json({ error: 'Ride not found' });
+    }
+    if (row.status !== 'completed') {
+      return res.status(409).json({ error: 'Ride is not completed' });
+    }
+    if (row.payment_status !== 'awaiting_payment') {
+      return res.status(409).json({ error: 'Payment is not pending for this ride' });
+    }
+
+    const { data: alreadyForRide } = await supabase
+      .from('coin_transactions')
+      .select('id')
+      .eq('user_id', uid)
+      .eq('ride_id', id)
+      .eq('type', 'payment_redeem_customer')
+      .limit(1)
+      .maybeSingle();
+    if (alreadyForRide?.id) {
+      return res.json({ ok: true, ride: row, coins_applied: 0, already_applied: true });
+    }
+
+    const { startIso, endIso } = istDayRangeUtc();
+    const { data: usedTodayRows } = await supabase
+      .from('coin_transactions')
+      .select('id')
+      .eq('user_id', uid)
+      .eq('type', 'payment_redeem_customer')
+      .gte('created_at', startIso)
+      .lt('created_at', endIso)
+      .limit(1);
+    if ((usedTodayRows ?? []).length > 0) {
+      return res.status(409).json({ error: 'Coins can be used once per day during payment' });
+    }
+
+    const { data: coinRow } = await supabase.from('profiles').select('coin_balance').eq('id', uid).maybeSingle();
+    const balance = Number(coinRow?.coin_balance ?? 0);
+    if (balance < PAYMENT_COINS_DAILY_LIMIT) {
+      return res.status(400).json({ error: 'At least 20 coins are required' });
+    }
+
+    const currentFinal = Number(row.final_payable_inr ?? row.quoted_price_inr ?? 0);
+    if (!Number.isFinite(currentFinal) || currentFinal <= 0) {
+      return res.status(400).json({ error: 'Invalid payable amount' });
+    }
+    const applyCoins = Math.min(PAYMENT_COINS_DAILY_LIMIT, Math.max(0, Math.round(currentFinal)));
+    if (applyCoins <= 0) {
+      return res.status(400).json({ error: 'No payable amount left for coins' });
+    }
+    const nextFinal = roundMoney(Math.max(0, currentFinal - applyCoins));
+    const nextCoinDiscountInr = roundMoney(Number(row.coin_discount_inr ?? 0) + applyCoins);
+    const nextCoinsRedeemed = Math.max(0, Math.round(Number(row.coins_redeemed ?? 0)) + applyCoins);
+    const at = new Date().toISOString();
+
+    const { error: decErr } = await supabase.rpc('decrement_coin_balance', {
+      uid,
+      delta: applyCoins,
+    });
+    if (decErr) {
+      return res.status(500).json({ error: decErr.message });
+    }
+    const { error: txErr } = await supabase.from('coin_transactions').insert({
+      user_id: uid,
+      ride_id: id,
+      coins: -applyCoins,
+      type: 'payment_redeem_customer',
+      description: `Payment-time coin usage: ${applyCoins} coins (₹${applyCoins})`,
+    });
+    if (txErr) {
+      await supabase.rpc('increment_coin_balance', { uid, delta: applyCoins });
+      return res.status(500).json({ error: txErr.message });
+    }
+
+    const { data: updatedRide, error: upErr } = await supabase
+      .from('ride_requests')
+      .update({
+        final_payable_inr: nextFinal,
+        coin_discount_inr: nextCoinDiscountInr,
+        coins_redeemed: nextCoinsRedeemed,
+        updated_at: at,
+      })
+      .eq('id', id)
+      .eq('customer_id', uid)
+      .eq('status', 'completed')
+      .eq('payment_status', 'awaiting_payment')
+      .select('*')
+      .maybeSingle();
+    if (upErr || !updatedRide) {
+      await supabase.rpc('increment_coin_balance', { uid, delta: applyCoins });
+      await supabase.from('coin_transactions').insert({
+        user_id: uid,
+        ride_id: id,
+        coins: applyCoins,
+        type: 'payment_redeem_customer_reversal',
+        description: `Reversal of payment-time coin usage: ${applyCoins} coins`,
+      });
+      return res.status(500).json({ error: upErr?.message ?? 'Could not apply payment coins' });
+    }
+
+    emitRide(io, updatedRide);
+    return res.json({ ok: true, ride: updatedRide, coins_applied: applyCoins });
   });
 
   /** Captain: customer paid Oshu’s company UPI / QR (with or without 1% discount; no Razorpay, no COD ledger). */

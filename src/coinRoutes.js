@@ -21,6 +21,16 @@ const COINS_PER_KM_DEFAULT  = 7;   // km to earn 1 coin
 const COIN_VALUE_INR        = 1;   // 1 coin = ₹1
 const MIN_REDEEM_DEFAULT    = 10;  // min coins needed before redeem allowed
 const MAX_REDEEM_PCT_DEFAULT = 20; // max % of fare payable via coins
+const PAYMENT_COINS_DAILY_LIMIT = 20;
+
+function istDayRangeUtc(now = new Date()) {
+  const IST_OFFSET_MS = 330 * 60 * 1000;
+  const shifted = new Date(now.getTime() + IST_OFFSET_MS);
+  shifted.setUTCHours(0, 0, 0, 0);
+  const start = new Date(shifted.getTime() - IST_OFFSET_MS);
+  const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+  return { startIso: start.toISOString(), endIso: end.toISOString() };
+}
 
 async function loadCoinConfig(supabase) {
   const { data } = await supabase
@@ -166,6 +176,16 @@ export function registerCoinRoutes(app, { supabase, getUserIdFromAccessToken }) 
       loadCoinConfig(supabase),
     ]);
     if (!profile) return res.status(404).json({ error: 'Profile not found' });
+    const { startIso, endIso } = istDayRangeUtc();
+    const { data: usedPaymentCoinRows } = await supabase
+      .from('coin_transactions')
+      .select('id')
+      .eq('user_id', uid)
+      .eq('type', 'payment_redeem_customer')
+      .gte('created_at', startIso)
+      .lt('created_at', endIso)
+      .limit(1);
+    const paymentCoinsUsedToday = (usedPaymentCoinRows ?? []).length > 0;
     return res.json({
       coin_balance: profile.coin_balance ?? 0,
       coin_value_inr: COIN_VALUE_INR,
@@ -173,6 +193,9 @@ export function registerCoinRoutes(app, { supabase, getUserIdFromAccessToken }) 
       min_redeem: config.minRedeem,
       max_redeem_pct: config.maxRedeemPct,
       can_redeem: (profile.coin_balance ?? 0) >= config.minRedeem,
+      payment_coins_daily_limit: PAYMENT_COINS_DAILY_LIMIT,
+      payment_coins_used_today: paymentCoinsUsedToday,
+      payment_coins_remaining_today: paymentCoinsUsedToday ? 0 : PAYMENT_COINS_DAILY_LIMIT,
     });
   });
 
