@@ -1438,7 +1438,10 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
     const capLng = parseFloat(String(req.query.lng ?? ''));
     const hasCap = !Number.isNaN(capLat) && !Number.isNaN(capLng);
     // Hard guard: offline captains must not receive open requests.
-    // Require a recent "available" presence heartbeat before returning pending rides.
+    // Primary gate is a recent "available" presence heartbeat.
+    // Fallback: if the captain explicitly sent fresh lat/lng in this pending request,
+    // treat that as an online signal for feed visibility (prevents false "no offers"
+    // when heartbeat delivery is flaky on some devices).
     const presenceFreshBefore = new Date(Date.now() - 3 * 60 * 1000).toISOString();
     const { data: myPresence } = await supabase
       .from('captain_presence')
@@ -1447,7 +1450,7 @@ export function registerRideRoutes(app, { supabase, getUserIdFromAccessToken, io
       .maybeSingle();
     const isPresenceFresh =
       !!myPresence?.updated_at && new Date(myPresence.updated_at).getTime() >= new Date(presenceFreshBefore).getTime();
-    const isDispatchEligible = Boolean(myPresence?.is_available) && isPresenceFresh;
+    const isDispatchEligible = (Boolean(myPresence?.is_available) && isPresenceFresh) || hasCap;
     if (!isDispatchEligible) {
       return res.json({ rides: [] });
     }
