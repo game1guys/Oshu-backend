@@ -720,8 +720,8 @@ export function registerAdminRoutes(app, { supabase, getUserIdFromAccessToken })
       .from('profiles')
       .select(
         `id, full_name, phone, avatar_url, coin_balance,
-         captain_kyc_status, captain_oshu_id, captain_vehicle_submitted_at,
-         profile_completed_at, created_at`,
+         captain_kyc_status, captain_documents, captain_oshu_id, captain_vehicle_submitted_at,
+         profile_completed_at, created_at, updated_at`,
         { count: 'exact' },
       )
       .eq('role', 'captain')
