@@ -40,6 +40,47 @@ const supabase =
       })
     : null;
 
+async function seedAdminUser() {
+  if (!supabase) return;
+  const email = 'admin@oshu.in';
+  const password = 'Test@123';
+  
+  console.log(`[seed] Ensuring admin user: ${email}`);
+  
+  const { data: userData, error: userError } = await supabase.auth.admin.createUser({
+    email,
+    password,
+    email_confirm: true,
+    user_metadata: { full_name: 'Oshu Admin' }
+  });
+
+  let userId = userData?.user?.id;
+
+  if (userError) {
+    if (userError.message.includes('already registered') || userError.message.includes('already exists')) {
+      const { data: users } = await supabase.auth.admin.listUsers();
+      const existingUser = users?.users?.find(u => u.email === email);
+      if (existingUser) {
+        userId = existingUser.id;
+        await supabase.auth.admin.updateUserById(userId, { password });
+      }
+    } else {
+      console.error('[seed] Error creating admin:', userError.message);
+    }
+  }
+
+  if (userId) {
+    await supabase.from('profiles').upsert({
+      id: userId,
+      role: 'admin',
+      full_name: 'Oshu Admin'
+    });
+    console.log('[seed] Admin profile ensured.');
+  }
+}
+
+seedAdminUser();
+
 /** User JWT validation — same as phone-session (anon client). Service-role getUser(jwt) can fail for user access tokens. */
 const userAuthClient =
   supabaseUrl && anonKey
